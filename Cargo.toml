@@ -1,0 +1,20 @@
+[package]
+name = "linguaspark"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Pure Rust inference for Bergamot-compatible Marian translation models"
+
+[dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+rten-gemm = "0.24"
+rten-tensor = "0.24"
+sentencepiece-rs = "0.2.2"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+yaml_serde = "0.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
