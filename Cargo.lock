@@ -157,8 +157,11 @@ name = "linguaspark"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "rayon",
  "rten-gemm",
+ "rten-simd",
  "rten-tensor",
+ "rten-vecmath",
  "sentencepiece-rs",
  "serde",
  "sha2",
@@ -251,6 +254,16 @@ dependencies = [
  "rten-base",
  "smallvec",
  "typeid",
+]
+
+[[package]]
+name = "rten-vecmath"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9574ddebf5671bc08ceb76e2e1638fadc57fdeff318634eab2c29e9a803cff64"
+dependencies = [
+ "rten-base",
+ "rten-simd",
 ]
 
 [[package]]

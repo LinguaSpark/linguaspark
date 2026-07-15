@@ -34,6 +34,10 @@ pub struct Translator {
     target_vocab: Vocabulary,
     shortlist: Shortlist,
     shared_vocab: bool,
+    source_eos: TokenId,
+    target_eos: TokenId,
+    #[cfg(not(target_family = "wasm"))]
+    execution: rayon::ThreadPool,
 }
 
 impl Translator {
@@ -54,6 +58,12 @@ impl Translator {
                 (Vocabulary::load(source)?, Vocabulary::load(target)?, false)
             }
         };
+        let source_eos = source_vocab.eos_id().ok_or_else(|| {
+            LoadError::InvalidSentencePiece("source vocabulary has no EOS token".into())
+        })?;
+        let target_eos = target_vocab.eos_id().ok_or_else(|| {
+            LoadError::InvalidSentencePiece("target vocabulary has no EOS token".into())
+        })?;
         let shortlist = Shortlist::load(assets.shortlist)?;
         if source_vocab.len() != model.config.dim_vocabs[0]
             || target_vocab.len() != model.config.dim_vocabs[1]
@@ -77,6 +87,13 @@ impl Translator {
 
         let (network, metadata) = Network::compile(model)?;
 
+        #[cfg(not(target_family = "wasm"))]
+        let execution = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|_| "linguaspark-translator".into())
+            .build()
+            .map_err(|err| LoadError::ThreadPool(err.to_string()))?;
+
         Ok(Self {
             metadata,
             network,
@@ -84,6 +101,10 @@ impl Translator {
             target_vocab,
             shortlist,
             shared_vocab,
+            source_eos,
+            target_eos,
+            #[cfg(not(target_family = "wasm"))]
+            execution,
         })
     }
 
@@ -118,69 +139,116 @@ impl Translator {
         input: &str,
         options: &DecodeOptions,
     ) -> Result<Translation, TranslateError> {
+        self.execute(|| {
+            let mut translations = self.translate_batch_inner(&[input], options)?;
+            Ok(translations
+                .pop()
+                .expect("single-input batch returned empty"))
+        })
+    }
+
+    /// Translate a tensor batch using Marian-compatible padding and beam search.
+    ///
+    /// The caller controls request scheduling. A `Translator` is one synchronous
+    /// execution unit and processes the supplied slice as a single padded batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid decode options, tokenization failures or
+    /// inference failures.
+    pub fn translate_batch<S: AsRef<str>>(
+        &self,
+        inputs: &[S],
+        options: &DecodeOptions,
+    ) -> Result<Vec<Translation>, TranslateError> {
+        let inputs = inputs.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+        self.execute(move || self.translate_batch_inner(&inputs, options))
+    }
+
+    fn translate_batch_inner<S: AsRef<str>>(
+        &self,
+        inputs: &[S],
+        options: &DecodeOptions,
+    ) -> Result<Vec<Translation>, TranslateError> {
         validate_decode_options(options)?;
-        let source = self.source_vocab.encode(input, true)?;
-        if source.len() == 1 {
-            return Ok(Translation {
-                text: String::new(),
-                token_ids: Vec::new(),
-                score: 0.0,
-                stop_reason: StopReason::EndOfSentence,
-            });
+        if inputs.is_empty() {
+            return Ok(Vec::new());
         }
 
+        let sources = inputs
+            .iter()
+            .map(|input| self.source_vocab.encode(input.as_ref(), true))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (padded, mask, width, empty_inputs) = pad_sources(&sources, self.source_eos);
+        let batch_size = sources.len();
         let shortlist =
             self.shortlist
-                .generate_shared(&source, self.target_vocab.len(), self.shared_vocab);
+                .generate_shared(&padded, self.target_vocab.len(), self.shared_vocab);
         let output = self.network.prepare_output(&shortlist)?;
-        let encoded = self.network.encode(&source)?;
-        let eos = self.target_vocab.eos_id().ok_or_else(|| {
-            TranslateError::Inference("target vocabulary has no EOS token".into())
-        })?;
-        let max_len = ((source.len() as f32) * options.max_length_factor)
-            .ceil()
-            .max(1.0) as usize;
-        let best = decoding::decode(decoding::DecodeRequest {
+        let encoded = self
+            .network
+            .encode_batch(&padded, &mask, batch_size, width)?;
+        let max_len = ((width as f32) * options.max_length_factor).ceil().max(1.0) as usize;
+        let decoded = decoding::decode_batch(decoding::DecodeBatchRequest {
             network: &self.network,
             encoded: &encoded,
             output: &output,
             shortlist: &shortlist,
             forbidden: (!options.allow_unknown).then(|| self.target_vocab.unk_id()),
-            eos,
+            eos: self.target_eos,
+            empty_inputs: &empty_inputs,
             max_len,
             options,
         })?;
-        let text = self.target_vocab.decode(&best.tokens)?;
-        Ok(Translation {
-            text,
-            token_ids: best.tokens,
-            score: best.score,
-            stop_reason: if best.finished {
-                StopReason::EndOfSentence
-            } else {
-                StopReason::LengthLimit
-            },
-        })
-    }
-
-    /// Translate several inputs sequentially.
-    ///
-    /// This is an API convenience rather than tensor batching. Input order is
-    /// preserved and the first error stops the operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first error produced while translating the inputs.
-    pub fn translate_many<S: AsRef<str>>(
-        &self,
-        inputs: &[S],
-        options: &DecodeOptions,
-    ) -> Result<Vec<Translation>, TranslateError> {
-        inputs
-            .iter()
-            .map(|input| self.translate(input.as_ref(), options))
+        decoded
+            .into_iter()
+            .map(|best| {
+                let text = self.target_vocab.decode(&best.tokens)?;
+                Ok(Translation {
+                    text,
+                    token_ids: best.tokens,
+                    score: best.score,
+                    stop_reason: if best.finished {
+                        StopReason::EndOfSentence
+                    } else {
+                        StopReason::LengthLimit
+                    },
+                })
+            })
             .collect()
     }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn execute<R: Send>(&self, operation: impl FnOnce() -> R + Send) -> R {
+        self.execution.install(operation)
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn execute<R>(&self, operation: impl FnOnce() -> R) -> R {
+        operation()
+    }
+}
+
+fn pad_sources(
+    sources: &[Vec<TokenId>],
+    eos: TokenId,
+) -> (Vec<TokenId>, Vec<bool>, usize, Vec<bool>) {
+    let batch_size = sources.len();
+    let width = sources.iter().map(Vec::len).max().unwrap_or(0);
+    let mut padded = vec![eos; batch_size * width];
+    let mut mask = vec![false; padded.len()];
+    for (batch, source) in sources.iter().enumerate() {
+        for (position, &token) in source.iter().enumerate() {
+            let index = position * batch_size + batch;
+            padded[index] = token;
+            mask[index] = true;
+        }
+    }
+    let empty = sources
+        .iter()
+        .map(|source| source.as_slice() == [eos])
+        .collect();
+    (padded, mask, width, empty)
 }
 
 fn validate_decode_options(options: &DecodeOptions) -> Result<(), TranslateError> {
@@ -204,7 +272,7 @@ fn validate_decode_options(options: &DecodeOptions) -> Result<(), TranslateError
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeOptions, validate_decode_options};
+    use super::{DecodeOptions, pad_sources, validate_decode_options};
 
     #[test]
     fn accepts_default_decode_options() {
@@ -240,5 +308,18 @@ mod tests {
             ..DecodeOptions::default()
         };
         assert!(validate_decode_options(&options).is_err());
+    }
+
+    #[test]
+    fn pads_sources_like_marian() {
+        let sources = vec![vec![10, 11, 0], vec![20, 0], vec![0]];
+        let (tokens, mask, width, empty) = pad_sources(&sources, 0);
+        assert_eq!(width, 3);
+        assert_eq!(tokens, [10, 20, 0, 11, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            mask,
+            [true, true, true, true, true, false, true, false, false]
+        );
+        assert_eq!(empty, [false, false, true]);
     }
 }

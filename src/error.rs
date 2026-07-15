@@ -21,13 +21,13 @@ pub enum LoadError {
 
     #[error("invalid SentencePiece model: {0}")]
     InvalidSentencePiece(String),
+
+    #[error("failed to create translation execution context: {0}")]
+    ThreadPool(String),
 }
 
 #[derive(Debug, Error)]
 pub enum TranslateError {
-    #[error("translation inference is not initialized")]
-    NotInitialized,
-
     #[error("invalid translation input: {0}")]
     InvalidInput(String),
 

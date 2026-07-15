@@ -26,11 +26,21 @@ pub enum TensorData {
     QuantizedI8 { values: Vec<i8>, multiplier: f32 },
 }
 
+impl TensorData {
+    #[must_use]
+    pub fn tensor_type(&self) -> TensorType {
+        match self {
+            Self::Bytes(_) => TensorType::Int8,
+            Self::F32(_) => TensorType::Float32,
+            Self::QuantizedI8 { .. } => TensorType::IntGemm8,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Tensor {
     pub name: String,
     pub shape: Vec<usize>,
-    pub tensor_type: TensorType,
     pub data: TensorData,
 }
 
@@ -38,6 +48,11 @@ impl Tensor {
     #[must_use]
     pub fn element_count(&self) -> usize {
         self.shape.iter().product()
+    }
+
+    #[must_use]
+    pub fn tensor_type(&self) -> TensorType {
+        self.data.tensor_type()
     }
 }
 
@@ -252,13 +267,10 @@ fn parse_tensor(
     payload: Vec<u8>,
 ) -> Result<Tensor, LoadError> {
     let element_count = checked_elements(&shape)?;
-    let (tensor_type, data) = match header.type_code {
+    let data = match header.type_code {
         TYPE_INT8 => {
             ensure_payload(&name, header.data_len, element_count)?;
-            (
-                TensorType::Int8,
-                TensorData::Bytes(payload[..element_count].to_vec()),
-            )
+            TensorData::Bytes(payload[..element_count].to_vec())
         }
         TYPE_FLOAT32 => {
             let byte_count = element_count
@@ -274,7 +286,7 @@ fn parse_tensor(
                     Ok(f32::from_le_bytes(bytes))
                 })
                 .collect::<Result<Vec<_>, LoadError>>()?;
-            (TensorType::Float32, TensorData::F32(values))
+            TensorData::F32(values)
         }
         TYPE_INTGEMM8 => {
             let required = element_count
@@ -297,10 +309,7 @@ fn parse_tensor(
                     "tensor {name} has invalid quantization multiplier {multiplier}"
                 )));
             }
-            (
-                TensorType::IntGemm8,
-                TensorData::QuantizedI8 { values, multiplier },
-            )
+            TensorData::QuantizedI8 { values, multiplier }
         }
         other => {
             return Err(LoadError::InvalidModel(format!(
@@ -308,12 +317,7 @@ fn parse_tensor(
             )));
         }
     };
-    Ok(Tensor {
-        name,
-        shape,
-        tensor_type,
-        data,
-    })
+    Ok(Tensor { name, shape, data })
 }
 
 struct HashingReader<R> {
@@ -414,7 +418,7 @@ mod tests {
 
     use crate::asset::Asset;
 
-    use super::{ModelArchive, TYPE_FLOAT32, TYPE_INTGEMM8, TensorData};
+    use super::{ModelArchive, TYPE_FLOAT32, TYPE_INTGEMM8, TensorData, TensorType};
 
     struct Item {
         name: String,
@@ -517,6 +521,10 @@ version: test
             panic!("expected float tensor")
         };
         assert_eq!(values, &[1.5, -2.0]);
+        assert_eq!(
+            archive.tensor("weight").unwrap().tensor_type(),
+            TensorType::Float32
+        );
     }
 
     #[test]
@@ -543,6 +551,10 @@ version: test
         };
         assert_eq!(values, &[1, -1]);
         assert_eq!(*multiplier, 2.5);
+        assert_eq!(
+            archive.tensor("weight").unwrap().tensor_type(),
+            TensorType::IntGemm8
+        );
     }
 
     #[test]

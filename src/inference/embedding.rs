@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::error::{LoadError, TranslateError};
 use crate::inference::backend::Linear;
-use crate::model::{Tensor, TensorData, TensorType};
+use crate::model::{Tensor, TensorData};
 use crate::text::TokenId;
 
 #[derive(Clone)]
@@ -133,17 +133,16 @@ impl OutputProjection {
             values.extend_from_slice(&self.values[token * self.dim..(token + 1) * self.dim]);
             bias.push(self.bias[token]);
         }
-        let tensor = Tensor {
-            name: "decoder_output_shortlist".into(),
-            shape: vec![self.dim, shortlist.len()],
-            tensor_type: TensorType::IntGemm8,
-            data: TensorData::QuantizedI8 {
-                values,
-                multiplier: self.weight_multiplier,
-            },
-        };
-        let linear = Linear::compile(tensor, Some(bias), self.activation_multiplier)
-            .map_err(|err| TranslateError::Inference(err.to_string()))?;
+        let linear = Linear::from_quantized(
+            "decoder_output_shortlist",
+            self.dim,
+            shortlist.len(),
+            values,
+            self.weight_multiplier,
+            self.activation_multiplier,
+            Some(bias),
+        )
+        .map_err(|err| TranslateError::Inference(err.to_string()))?;
         Ok(PreparedOutput { linear })
     }
 }
@@ -152,7 +151,7 @@ impl OutputProjection {
 mod tests {
     use std::sync::Arc;
 
-    use crate::model::{Tensor, TensorData, TensorType};
+    use crate::model::{Tensor, TensorData};
 
     use super::{Embedding, OutputProjection};
 
@@ -160,7 +159,6 @@ mod tests {
         Tensor {
             name: "embedding".into(),
             shape: shape.to_vec(),
-            tensor_type: TensorType::IntGemm8,
             data: TensorData::QuantizedI8 {
                 values,
                 multiplier: 1.0,

@@ -67,9 +67,27 @@ pub(crate) struct Network {
     decoder: Vec<DecoderLayer>,
 }
 
-pub(crate) struct EncodedSource {
-    len: usize,
+pub(crate) struct EncodedBatch {
+    batch_size: usize,
+    width: usize,
+    mask: Vec<bool>,
     cross: Vec<CrossCache>,
+}
+
+pub(crate) struct DecodeStepRequest<'a> {
+    pub source: &'a EncodedBatch,
+    pub source_indices: &'a [usize],
+    pub beam_size: usize,
+    pub previous: &'a [Option<TokenId>],
+    pub position: usize,
+    pub output: &'a PreparedOutput,
+}
+
+#[derive(Clone, Copy)]
+struct AttentionShape {
+    query_rows: usize,
+    key_rows: usize,
+    groups: usize,
 }
 
 #[derive(Clone)]
@@ -228,12 +246,36 @@ impl Network {
         self.output.prepare(shortlist)
     }
 
-    pub(crate) fn encode(&self, source: &[TokenId]) -> Result<EncodedSource, TranslateError> {
-        let len = source.len();
-        let mut hidden = self.source_embedding.lookup(source)?;
-        scale_and_add_positions(&mut hidden, len, 0, self.spec.dim);
+    pub(crate) fn encode_batch(
+        &self,
+        source: &[TokenId],
+        mask: &[bool],
+        batch_size: usize,
+        width: usize,
+    ) -> Result<EncodedBatch, TranslateError> {
+        if source.len() != batch_size * width || mask.len() != source.len() {
+            return Err(TranslateError::Inference(
+                "invalid source batch dimensions".into(),
+            ));
+        }
+
+        // Marian stores input IDs time-major. Attention is simpler with each
+        // sentence contiguous, so transpose to [batch, time] after lookup.
+        let time_major = self.source_embedding.lookup(source)?;
+        let mut hidden = vec![0.0; time_major.len()];
+        for time in 0..width {
+            for batch in 0..batch_size {
+                let source_row = time * batch_size + batch;
+                let target_row = batch * width + time;
+                hidden[target_row * self.spec.dim..(target_row + 1) * self.spec.dim]
+                    .copy_from_slice(
+                        &time_major[source_row * self.spec.dim..(source_row + 1) * self.spec.dim],
+                    );
+            }
+        }
+        scale_and_add_batch_positions(&mut hidden, batch_size, width, self.spec.dim);
         for layer in &self.encoder {
-            hidden = layer.apply(&hidden, len)?;
+            hidden = layer.apply_batch(&hidden, batch_size, width, mask)?;
         }
 
         let mut cross = Vec::with_capacity(self.decoder.len());
@@ -243,36 +285,56 @@ impl Network {
                 values: layer.attention.value.apply(&hidden)?,
             });
         }
-        Ok(EncodedSource { len, cross })
+        Ok(EncodedBatch {
+            batch_size,
+            width,
+            mask: mask.to_vec(),
+            cross,
+        })
     }
 
-    pub(crate) fn decode_step(
+    pub(crate) fn decode_step_batch(
         &self,
-        source: &EncodedSource,
         state: &mut DecoderState,
-        previous: &[Option<TokenId>],
-        position: usize,
-        output: &PreparedOutput,
+        request: DecodeStepRequest<'_>,
     ) -> Result<Vec<f32>, TranslateError> {
-        let rows = previous.len();
-        let mut hidden = self.target_embedding.lookup_optional(previous)?;
-        scale_and_add_positions(&mut hidden, rows, position, self.spec.dim);
+        let active_batch = request.source_indices.len();
+        let rows = request.beam_size * active_batch;
+        if request.previous.len() != rows {
+            return Err(TranslateError::Inference(
+                "invalid decoder batch dimensions".into(),
+            ));
+        }
+        let mut hidden = self.target_embedding.lookup_optional(request.previous)?;
+        scale_and_add_same_position(&mut hidden, rows, request.position, self.spec.dim);
 
         for (index, layer) in self.decoder.iter().enumerate() {
             hidden = layer.ssru.apply(&hidden, &mut state.cells[index])?;
-            hidden = layer
-                .attention
-                .apply_cross(&hidden, source.len, &source.cross[index])?;
+            hidden = layer.attention.apply_cross_batch(
+                &hidden,
+                request.source,
+                &request.source.cross[index],
+                request.source_indices,
+                request.beam_size,
+            )?;
             hidden = layer.ffn.apply(&hidden)?;
         }
 
-        output.linear.apply(&hidden)
+        request.output.linear.apply(&hidden)
     }
 }
 
 impl EncoderLayer {
-    fn apply(&self, input: &[f32], rows: usize) -> Result<Vec<f32>, TranslateError> {
-        let attended = self.attention.apply_self(input, rows)?;
+    fn apply_batch(
+        &self,
+        input: &[f32],
+        batch_size: usize,
+        width: usize,
+        time_major_mask: &[bool],
+    ) -> Result<Vec<f32>, TranslateError> {
+        let attended =
+            self.attention
+                .apply_self_batch(input, batch_size, width, time_major_mask)?;
         self.ffn.apply(&attended)
     }
 }
@@ -323,74 +385,175 @@ impl Attention {
         })
     }
 
-    fn apply_self(&self, input: &[f32], rows: usize) -> Result<Vec<f32>, TranslateError> {
+    fn apply_self_batch(
+        &self,
+        input: &[f32],
+        batch_size: usize,
+        width: usize,
+        time_major_mask: &[bool],
+    ) -> Result<Vec<f32>, TranslateError> {
         let queries = self.query.apply(input)?;
         let keys = self.key.apply(input)?;
         let values = self.value.apply(input)?;
-        self.attend(input, &queries, &keys, &values, rows)
-    }
-
-    fn apply_cross(
-        &self,
-        input: &[f32],
-        key_rows: usize,
-        cache: &CrossCache,
-    ) -> Result<Vec<f32>, TranslateError> {
-        let queries = self.query.apply(input)?;
-        self.attend(input, &queries, &cache.keys, &cache.values, key_rows)
-    }
-
-    fn attend(
-        &self,
-        residual: &[f32],
-        queries: &[f32],
-        keys: &[f32],
-        values: &[f32],
-        key_rows: usize,
-    ) -> Result<Vec<f32>, TranslateError> {
-        let query_rows = queries.len() / self.dim;
-        let mut joined = vec![0.0; query_rows * self.dim];
-        let scale = 1.0 / (self.head_dim as f32).sqrt();
-
-        let query_views = (0..self.heads)
-            .map(|head| MatrixView {
-                data: &queries[head * self.head_dim..],
-                rows: query_rows,
-                cols: self.head_dim,
-                row_stride: self.dim,
-                col_stride: 1,
+        let groups = batch_size * self.heads;
+        let query_views = (0..groups)
+            .map(|group| {
+                let batch = group / self.heads;
+                let head = group % self.heads;
+                MatrixView {
+                    data: &queries[(batch * width * self.dim) + head * self.head_dim..],
+                    rows: width,
+                    cols: self.head_dim,
+                    row_stride: self.dim,
+                    col_stride: 1,
+                }
             })
             .collect::<Vec<_>>();
-        let key_views = (0..self.heads)
-            .map(|head| MatrixView {
-                data: &keys[head * self.head_dim..],
-                rows: self.head_dim,
-                cols: key_rows,
-                row_stride: 1,
-                col_stride: self.dim,
+        let key_views = (0..groups)
+            .map(|group| {
+                let batch = group / self.heads;
+                let head = group % self.heads;
+                MatrixView {
+                    data: &keys[(batch * width * self.dim) + head * self.head_dim..],
+                    rows: self.head_dim,
+                    cols: width,
+                    row_stride: 1,
+                    col_stride: self.dim,
+                }
             })
             .collect::<Vec<_>>();
         let mut scores = batched_matmul_f32(&query_views, &key_views)?;
-        for row in scores.chunks_exact_mut(key_rows) {
-            for score in row.iter_mut() {
-                *score *= scale;
+        self.finish_attention(
+            input,
+            &mut scores,
+            AttentionShape {
+                query_rows: width,
+                key_rows: width,
+                groups,
+            },
+            |group, key| {
+                let batch = group / self.heads;
+                time_major_mask[key * batch_size + batch]
+            },
+            |group| {
+                let batch = group / self.heads;
+                let head = group % self.heads;
+                &values[(batch * width * self.dim) + head * self.head_dim..]
+            },
+        )
+    }
+
+    fn apply_cross_batch(
+        &self,
+        input: &[f32],
+        source: &EncodedBatch,
+        cache: &CrossCache,
+        source_indices: &[usize],
+        beam_size: usize,
+    ) -> Result<Vec<f32>, TranslateError> {
+        let queries = self.query.apply(input)?;
+        let active_batch = source_indices.len();
+        let groups = beam_size * active_batch * self.heads;
+        let query_views = (0..groups)
+            .map(|group| {
+                let row = group / self.heads;
+                let head = group % self.heads;
+                MatrixView {
+                    data: &queries[row * self.dim + head * self.head_dim..],
+                    rows: 1,
+                    cols: self.head_dim,
+                    row_stride: self.dim,
+                    col_stride: 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        let key_views = (0..groups)
+            .map(|group| {
+                let beam_batch = group / self.heads;
+                let current_batch = beam_batch % active_batch;
+                let source_batch = source_indices[current_batch];
+                let head = group % self.heads;
+                MatrixView {
+                    data: &cache.keys
+                        [(source_batch * source.width * self.dim) + head * self.head_dim..],
+                    rows: self.head_dim,
+                    cols: source.width,
+                    row_stride: 1,
+                    col_stride: self.dim,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut scores = batched_matmul_f32(&query_views, &key_views)?;
+        self.finish_attention(
+            input,
+            &mut scores,
+            AttentionShape {
+                query_rows: 1,
+                key_rows: source.width,
+                groups,
+            },
+            |group, key| {
+                let beam_batch = group / self.heads;
+                let current_batch = beam_batch % active_batch;
+                let source_batch = source_indices[current_batch];
+                source.mask[key * source.batch_size + source_batch]
+            },
+            |group| {
+                let beam_batch = group / self.heads;
+                let current_batch = beam_batch % active_batch;
+                let source_batch = source_indices[current_batch];
+                let head = group % self.heads;
+                &cache.values[(source_batch * source.width * self.dim) + head * self.head_dim..]
+            },
+        )
+    }
+
+    fn finish_attention<'a, M, V>(
+        &self,
+        residual: &[f32],
+        scores: &mut [f32],
+        shape: AttentionShape,
+        key_is_valid: M,
+        value_data: V,
+    ) -> Result<Vec<f32>, TranslateError>
+    where
+        M: Fn(usize, usize) -> bool,
+        V: Fn(usize) -> &'a [f32],
+    {
+        const MASK_VALUE: f32 = -99_999_999.0;
+        let AttentionShape {
+            query_rows,
+            key_rows,
+            groups,
+        } = shape;
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        for group in 0..groups {
+            let group_scores =
+                &mut scores[group * query_rows * key_rows..(group + 1) * query_rows * key_rows];
+            for row in group_scores.chunks_exact_mut(key_rows) {
+                for (key, score) in row.iter_mut().enumerate() {
+                    *score = if key_is_valid(group, key) {
+                        *score * scale
+                    } else {
+                        MASK_VALUE
+                    };
+                }
+                softmax(row);
             }
-            softmax(row);
         }
 
-        let score_head_stride = query_rows * key_rows;
-        let score_views = (0..self.heads)
-            .map(|head| MatrixView {
-                data: &scores[head * score_head_stride..],
+        let score_views = (0..groups)
+            .map(|group| MatrixView {
+                data: &scores[group * query_rows * key_rows..],
                 rows: query_rows,
                 cols: key_rows,
                 row_stride: key_rows,
                 col_stride: 1,
             })
             .collect::<Vec<_>>();
-        let value_views = (0..self.heads)
-            .map(|head| MatrixView {
-                data: &values[head * self.head_dim..],
+        let value_views = (0..groups)
+            .map(|group| MatrixView {
+                data: value_data(group),
                 rows: key_rows,
                 cols: self.head_dim,
                 row_stride: self.dim,
@@ -398,17 +561,23 @@ impl Attention {
             })
             .collect::<Vec<_>>();
         let attended = batched_matmul_f32(&score_views, &value_views)?;
+        let rows = residual.len() / self.dim;
+        let mut joined = vec![0.0; residual.len()];
         let attended_head_stride = query_rows * self.head_dim;
-        for head in 0..self.heads {
+        for group in 0..groups {
+            let row_group = group / self.heads;
+            let head = group % self.heads;
             let offset = head * self.head_dim;
             let head_values =
-                &attended[head * attended_head_stride..(head + 1) * attended_head_stride];
+                &attended[group * attended_head_stride..(group + 1) * attended_head_stride];
             for row in 0..query_rows {
                 let source = &head_values[row * self.head_dim..(row + 1) * self.head_dim];
-                let start = row * self.dim + offset;
+                let output_row = row_group * query_rows + row;
+                let start = output_row * self.dim + offset;
                 joined[start..start + self.head_dim].copy_from_slice(source);
             }
         }
+        debug_assert_eq!(rows * self.dim, joined.len());
 
         let projected = self.output.apply(&joined)?;
         self.norm.apply_residual(&projected, residual)
@@ -628,6 +797,29 @@ fn scale_and_add_positions(values: &mut [f32], rows: usize, start: usize, dim: u
     }
 }
 
+fn scale_and_add_batch_positions(values: &mut [f32], batch_size: usize, width: usize, dim: usize) {
+    for batch in 0..batch_size {
+        let start = batch * width * dim;
+        scale_and_add_positions(&mut values[start..start + width * dim], width, 0, dim);
+    }
+}
+
+fn scale_and_add_same_position(values: &mut [f32], rows: usize, position: usize, dim: usize) {
+    let embedding_scale = (dim as f32).sqrt();
+    let timescales = dim / 2;
+    let log_increment = 10_000.0f32.ln() / (timescales as f32 - 1.0);
+    for row in 0..rows {
+        for index in 0..dim {
+            values[row * dim + index] *= embedding_scale;
+        }
+        for index in 0..timescales {
+            let angle = position as f32 * (-(index as f32) * log_increment).exp();
+            values[row * dim + index] += angle.sin();
+            values[row * dim + timescales + index] += angle.cos();
+        }
+    }
+}
+
 fn softmax(values: &mut [f32]) {
     let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0;
@@ -648,7 +840,10 @@ fn sigmoid(value: f32) -> f32 {
 mod tests {
     use crate::model::ModelConfig;
 
-    use super::{LayerNorm, NetworkSpec, scale_and_add_positions, sigmoid, softmax};
+    use super::{
+        LayerNorm, NetworkSpec, scale_and_add_positions, scale_and_add_same_position, sigmoid,
+        softmax,
+    };
 
     fn config(dim: usize, dec_depth: usize, ffn_dim: usize, tying: &str) -> ModelConfig {
         ModelConfig::parse(&format!(
@@ -723,6 +918,13 @@ version: test
         let mut values = [0.0; 4];
         scale_and_add_positions(&mut values, 1, 0, 4);
         assert_eq!(values, [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn decoder_position_is_shared_across_batch_rows() {
+        let mut values = vec![1.0; 16];
+        scale_and_add_same_position(&mut values, 2, 3, 8);
+        assert_eq!(&values[..8], &values[8..]);
     }
 
     #[test]

@@ -98,12 +98,12 @@ fn translate(args: Vec<OsString>, benchmark: bool) -> Result<(), Box<dyn std::er
     let lines = input.lines().collect::<Vec<_>>();
 
     if benchmark {
-        let warmup = translator.translate_many(&lines, &decode)?;
+        let warmup = translator.translate_batch(&lines, &decode)?;
         std::hint::black_box(warmup);
         let iterations = 10;
         let start = Instant::now();
         for _ in 0..iterations {
-            std::hint::black_box(translator.translate_many(&lines, &decode)?);
+            std::hint::black_box(translator.translate_batch(&lines, &decode)?);
         }
         let elapsed = start.elapsed();
         println!("load_ms={:.3}", load_elapsed.as_secs_f64() * 1000.0);
@@ -117,7 +117,7 @@ fn translate(args: Vec<OsString>, benchmark: bool) -> Result<(), Box<dyn std::er
             println!("peak_rss_mib={:.3}", peak_kib as f64 / 1024.0);
         }
     } else {
-        for translation in translator.translate_many(&lines, &decode)? {
+        for translation in translator.translate_batch(&lines, &decode)? {
             println!("{}", translation.text);
         }
     }

@@ -2,7 +2,9 @@ use rten_gemm::{
     GemmExecutor, GemmInputA, GemmInputB, GemmOptions, GemmUninitOptions, PackedBMatrix,
     QuantParams,
 };
+use rten_simd::SimdOp;
 use rten_tensor::NdTensorView;
+use rten_vecmath::Quantize;
 
 use crate::error::{LoadError, TranslateError};
 use crate::model::{Tensor, TensorData};
@@ -123,12 +125,6 @@ impl Linear {
                 tensor.shape.len()
             )));
         }
-        if !activation_multiplier.is_finite() || activation_multiplier <= 0.0 {
-            return Err(LoadError::InvalidModel(format!(
-                "linear weight {} has invalid activation multiplier {activation_multiplier}",
-                tensor.name
-            )));
-        }
         let input_dim = tensor.shape[0];
         let output_dim = tensor.shape[1];
         let TensorData::QuantizedI8 {
@@ -142,15 +138,55 @@ impl Linear {
             )));
         };
 
+        Self::from_quantized(
+            &tensor.name,
+            input_dim,
+            output_dim,
+            values,
+            weight_multiplier,
+            activation_multiplier,
+            bias,
+        )
+    }
+
+    pub(crate) fn from_quantized(
+        name: &str,
+        input_dim: usize,
+        output_dim: usize,
+        values: Vec<i8>,
+        weight_multiplier: f32,
+        activation_multiplier: f32,
+        bias: Option<Vec<f32>>,
+    ) -> Result<Self, LoadError> {
+        if !activation_multiplier.is_finite() || activation_multiplier <= 0.0 {
+            return Err(LoadError::InvalidModel(format!(
+                "linear weight {name} has invalid activation multiplier {activation_multiplier}"
+            )));
+        }
+        let expected_values = input_dim
+            .checked_mul(output_dim)
+            .ok_or_else(|| LoadError::InvalidModel(format!("linear weight {name} is too large")))?;
+        if values.len() != expected_values {
+            return Err(LoadError::InvalidModel(format!(
+                "linear weight {name} has {} values, expected {expected_values}",
+                values.len()
+            )));
+        }
+        if !weight_multiplier.is_finite() || weight_multiplier <= 0.0 {
+            return Err(LoadError::InvalidModel(format!(
+                "linear weight {name} has invalid weight multiplier {weight_multiplier}"
+            )));
+        }
+
         // Marian stores logical [K, N] matrices physically as row-major [N, K].
-        let view = transposed_view(input_dim, output_dim, &values, &tensor.name)?;
+        let view = transposed_view(input_dim, output_dim, &values, name)?;
         let weight = GemmExecutor::<u8, i8, i32>::default().prepack_b(view);
 
         let bias = bias.unwrap_or_else(|| vec![0.0; output_dim]);
         if bias.len() != output_dim {
             return Err(LoadError::InvalidModel(format!(
                 "bias for {} has {} values, expected {output_dim}",
-                tensor.name,
+                name,
                 bias.len()
             )));
         }
@@ -200,11 +236,9 @@ impl Linear {
         // Marian Int8Shift quantizes symmetrically to [-127, 127], then adds
         // 127 before the unsigned x signed multiply. RTen's zero-point
         // correction is mathematically equivalent to intgemm PrepareBias.
-        let quantized = input
-            .iter()
-            .map(|&value| quantize_marian_shift(value, activation_multiplier))
-            .collect::<Vec<_>>();
-        let lhs = NdTensorView::from_data([rows, self.input_dim], quantized.as_slice());
+        let mut quantized = vec![std::mem::MaybeUninit::uninit(); input.len()];
+        let quantized = quantize_marian_shift_slice(input, &mut quantized, activation_multiplier);
+        let lhs = NdTensorView::from_data([rows, self.input_dim], &*quantized);
         let mut output = vec![std::mem::MaybeUninit::uninit(); rows * self.output_dim];
         let zero_point = vec![127u8; rows];
         let executor = GemmExecutor::<u8, i8, i32>::default();
@@ -226,6 +260,21 @@ impl Linear {
     }
 }
 
+fn quantize_marian_shift_slice<'a>(
+    input: &[f32],
+    output: &'a mut [std::mem::MaybeUninit<u8>],
+    multiplier: f32,
+) -> &'a mut [u8] {
+    let quantized = Quantize::new(input, output, multiplier, 127u8).dispatch();
+    // RTen saturates u8 quantization to 255. Marian Int8Shift first clamps
+    // the signed value to 127 and then adds 127, so its maximum is 254.
+    for value in quantized.iter_mut() {
+        *value = (*value).min(254);
+    }
+    quantized
+}
+
+#[cfg(test)]
 fn quantize_marian_shift(value: f32, multiplier: f32) -> u8 {
     let signed = (value * multiplier).round_ties_even().clamp(-127.0, 127.0) as i16;
     (signed + 127) as u8
@@ -243,15 +292,14 @@ fn transposed_view<'a, T: Copy>(
 
 #[cfg(test)]
 mod tests {
-    use crate::model::{Tensor, TensorData, TensorType};
+    use crate::model::{Tensor, TensorData};
 
-    use super::{Linear, quantize_marian_shift};
+    use super::{Linear, quantize_marian_shift, quantize_marian_shift_slice};
 
     fn tensor(shape: [usize; 2], values: Vec<i8>, multiplier: f32) -> Tensor {
         Tensor {
             name: "test_weight".into(),
             shape: shape.to_vec(),
-            tensor_type: TensorType::IntGemm8,
             data: TensorData::QuantizedI8 { values, multiplier },
         }
     }
@@ -275,6 +323,20 @@ mod tests {
     fn quantization_clamps_to_marian_range() {
         assert_eq!(quantize_marian_shift(1000.0, 1.0), 254);
         assert_eq!(quantize_marian_shift(-1000.0, 1.0), 0);
+    }
+
+    #[test]
+    fn simd_quantization_matches_marian_reference() {
+        let input = [
+            -1000.0, -127.5, -126.5, -0.5, 0.0, 0.5, 126.5, 127.5, 1000.0,
+        ];
+        let mut output = vec![std::mem::MaybeUninit::uninit(); input.len()];
+        let actual = quantize_marian_shift_slice(&input, &mut output, 1.0);
+        let expected = input
+            .iter()
+            .map(|&value| quantize_marian_shift(value, 1.0))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 
     #[test]
