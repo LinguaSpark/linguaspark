@@ -8,15 +8,12 @@ mod asset;
 mod decoding;
 mod error;
 mod inference;
-pub mod model;
+mod model;
 mod runtime;
-pub mod text;
+mod text;
 
 pub use asset::{Asset, Compression, ModelAssets, VocabularyAssets};
 pub use decoding::DecodeOptions;
 pub use error::{LoadError, TranslateError};
-pub use model::{
-    ModelArchive, ModelConfig, ModelMetadata, Shortlist, Tensor, TensorData, TensorType,
-};
 pub use runtime::{LoadOptions, StopReason, Translation, Translator};
-pub use text::{TokenId, Vocabulary};
+pub use text::TokenId;

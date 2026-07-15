@@ -6,9 +6,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use linguaspark::{
-    Asset, DecodeOptions, LoadOptions, ModelArchive, ModelAssets, Translator, VocabularyAssets,
-};
+use linguaspark::{Asset, DecodeOptions, LoadOptions, ModelAssets, Translator, VocabularyAssets};
 
 fn main() -> ExitCode {
     match run() {
@@ -25,25 +23,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let command = args.next().ok_or_else(usage)?;
     let args = args.collect::<Vec<_>>();
     match command.to_str() {
-        Some("inspect") => inspect(&args),
         Some("translate") => translate(args, false),
         Some("bench") => translate(args, true),
         _ => Err(usage().into()),
     }
-}
-
-fn inspect(args: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
-    let [path] = args else {
-        return Err("usage: linguaspark inspect MODEL[.gz]".into());
-    };
-    let model = ModelArchive::load(read_asset(path)?, None)?;
-    println!("model version: {}", model.config.version);
-    println!("architecture: {}", model.config.model_type);
-    println!("embedding dimension: {}", model.config.dim_emb);
-    println!("encoder layers: {}", model.config.enc_depth);
-    println!("decoder layers: {}", model.config.dec_depth);
-    println!("parameters: {} tensors", model.tensor_count());
-    Ok(())
 }
 
 fn translate(args: Vec<OsString>, benchmark: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -146,5 +129,5 @@ fn read_asset(path: impl AsRef<Path>) -> Result<Asset, io::Error> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  linguaspark inspect MODEL[.gz]\n  linguaspark translate MODEL SRC_VOCAB TRG_VOCAB SHORTLIST [--beam-size N] [TEXT]\n  linguaspark bench MODEL SRC_VOCAB TRG_VOCAB SHORTLIST [--beam-size N] [TEXT]"
+    "usage:\n  linguaspark translate MODEL SRC_VOCAB TRG_VOCAB SHORTLIST [--beam-size N] [TEXT]\n  linguaspark bench MODEL SRC_VOCAB TRG_VOCAB SHORTLIST [--beam-size N] [TEXT]"
 }

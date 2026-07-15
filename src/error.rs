@@ -3,6 +3,7 @@ use std::io;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum LoadError {
     #[error("failed to read an asset: {0}")]
     Io(#[from] io::Error),
@@ -27,6 +28,7 @@ pub enum LoadError {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TranslateError {
     #[error("invalid translation input: {0}")]
     InvalidInput(String),

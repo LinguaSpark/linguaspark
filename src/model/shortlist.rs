@@ -4,13 +4,9 @@ use crate::error::LoadError;
 const BINARY_SHORTLIST_MAGIC: u64 = 0xF11A_48D5_0134_17F5;
 
 #[derive(Debug)]
-pub struct Shortlist {
+pub(crate) struct Shortlist {
     /// Number of globally frequent target tokens included at runtime.
-    pub first_num: usize,
-    /// Number of lexical candidates retained per source token when this binary
-    /// file was generated. The candidates are already baked into the file, so
-    /// this value is metadata rather than a runtime truncation parameter.
-    pub best_num: usize,
+    first_num: usize,
     offsets: Vec<usize>,
     target_ids: Vec<u32>,
 }
@@ -22,7 +18,7 @@ impl Shortlist {
     ///
     /// Returns an error for malformed headers, invalid offsets or a checksum
     /// mismatch.
-    pub fn load(asset: Asset) -> Result<Self, LoadError> {
+    pub(crate) fn load(asset: Asset) -> Result<Self, LoadError> {
         let bytes = asset.decode()?;
         if bytes.len() < 48 {
             return Err(LoadError::InvalidShortlist(format!(
@@ -38,7 +34,10 @@ impl Shortlist {
         }
 
         let first_num = usize_value(u64_at(&bytes, 16)?)?;
-        let best_num = usize_value(u64_at(&bytes, 24)?)?;
+        // This generation parameter is baked into the candidate table. Parse
+        // it to validate the header representation, but runtime lookup does
+        // not need to retain it or truncate candidates again.
+        let _best_num = usize_value(u64_at(&bytes, 24)?)?;
         let offset_count = usize_value(u64_at(&bytes, 32)?)?;
         let target_count = usize_value(u64_at(&bytes, 40)?)?;
         let expected_len = 48usize
@@ -89,27 +88,21 @@ impl Shortlist {
 
         Ok(Self {
             first_num,
-            best_num,
             offsets,
             target_ids,
         })
     }
 
     #[must_use]
-    pub fn source_vocab_size(&self) -> usize {
+    pub(crate) fn source_vocab_size(&self) -> usize {
         self.offsets.len().saturating_sub(1)
     }
 
     #[must_use]
-    pub fn candidates(&self, source_id: usize) -> Option<&[u32]> {
+    fn candidates(&self, source_id: usize) -> Option<&[u32]> {
         let start = *self.offsets.get(source_id)?;
         let end = *self.offsets.get(source_id + 1)?;
         self.target_ids.get(start..end)
-    }
-
-    #[must_use]
-    pub fn generate(&self, source_ids: &[u32], target_vocab_size: usize) -> Vec<u32> {
-        self.generate_impl(source_ids, target_vocab_size, false)
     }
 
     pub(crate) fn generate_shared(
@@ -263,7 +256,6 @@ mod tests {
     fn loads_valid_shortlist() {
         let shortlist = load(binary(2, 3, &[0, 2, 3], &[4, 5, 6])).unwrap();
         assert_eq!(shortlist.first_num, 2);
-        assert_eq!(shortlist.best_num, 3);
         assert_eq!(shortlist.source_vocab_size(), 2);
         assert_eq!(shortlist.candidates(0), Some([4, 5].as_slice()));
         assert_eq!(shortlist.candidates(1), Some([6].as_slice()));
@@ -306,7 +298,6 @@ mod tests {
     fn generates_frequent_and_lexical_candidates() {
         let shortlist = Shortlist {
             first_num: 2,
-            best_num: 1,
             offsets: vec![0, 1, 2],
             target_ids: vec![10, 12],
         };
@@ -321,7 +312,6 @@ mod tests {
     fn shared_generation_copies_deduplicates_and_sorts() {
         let shortlist = Shortlist {
             first_num: 1,
-            best_num: 0,
             offsets: vec![0; 17],
             target_ids: Vec::new(),
         };

@@ -12,25 +12,27 @@ const TYPE_INT8: u64 = 0x0101;
 const TYPE_FLOAT32: u64 = 0x0404;
 const TYPE_INTGEMM8: u64 = 0x4101;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TensorType {
+enum TensorType {
     Int8,
     Float32,
     IntGemm8,
 }
 
 #[derive(Debug)]
-pub enum TensorData {
-    Bytes(Vec<u8>),
+pub(crate) enum TensorData {
+    Bytes,
     F32(Vec<f32>),
     QuantizedI8 { values: Vec<i8>, multiplier: f32 },
 }
 
 impl TensorData {
+    #[cfg(test)]
     #[must_use]
-    pub fn tensor_type(&self) -> TensorType {
+    fn tensor_type(&self) -> TensorType {
         match self {
-            Self::Bytes(_) => TensorType::Int8,
+            Self::Bytes => TensorType::Int8,
             Self::F32(_) => TensorType::Float32,
             Self::QuantizedI8 { .. } => TensorType::IntGemm8,
         }
@@ -38,20 +40,21 @@ impl TensorData {
 }
 
 #[derive(Debug)]
-pub struct Tensor {
-    pub name: String,
-    pub shape: Vec<usize>,
-    pub data: TensorData,
+pub(crate) struct Tensor {
+    pub(crate) name: String,
+    pub(crate) shape: Vec<usize>,
+    pub(crate) data: TensorData,
 }
 
 impl Tensor {
     #[must_use]
-    pub fn element_count(&self) -> usize {
+    pub(crate) fn element_count(&self) -> usize {
         self.shape.iter().product()
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub fn tensor_type(&self) -> TensorType {
+    fn tensor_type(&self) -> TensorType {
         self.data.tensor_type()
     }
 }
@@ -59,18 +62,9 @@ impl Tensor {
 /// Parsed Marian binary archive before its tensors are consumed and packed by
 /// the inference runtime.
 #[derive(Debug)]
-pub struct ModelArchive {
-    pub config: ModelConfig,
+pub(crate) struct ModelArchive {
+    pub(crate) config: ModelConfig,
     tensors: HashMap<String, Tensor>,
-    parameter_count: usize,
-}
-
-/// Immutable metadata retained after model tensors are compiled into runtime
-/// weights.
-#[derive(Debug, Clone)]
-pub struct ModelMetadata {
-    pub config: ModelConfig,
-    pub tensor_count: usize,
 }
 
 #[derive(Debug)]
@@ -88,7 +82,7 @@ impl ModelArchive {
     ///
     /// Returns an error if decompression, integrity verification, binary
     /// parsing or basic configuration validation fails.
-    pub fn load(asset: Asset, expected_sha256: Option<[u8; 32]>) -> Result<Self, LoadError> {
+    pub(crate) fn load(asset: Asset, expected_sha256: Option<[u8; 32]>) -> Result<Self, LoadError> {
         let mut reader = HashingReader::new(asset.into_reader());
 
         let version = read_u64(&mut reader)?;
@@ -149,41 +143,17 @@ impl ModelArchive {
             .ok_or_else(|| LoadError::InvalidModel("missing special:model.yml metadata".into()))?;
         config.validate_well_formed()?;
 
-        let parameter_count = tensors.len();
-        Ok(Self {
-            config,
-            tensors,
-            parameter_count,
-        })
+        Ok(Self { config, tensors })
     }
 
-    #[must_use]
-    pub fn tensor(&self, name: &str) -> Option<&Tensor> {
+    #[cfg(test)]
+    fn tensor(&self, name: &str) -> Option<&Tensor> {
         self.tensors.get(name)
     }
 
-    pub fn tensors(&self) -> impl Iterator<Item = &Tensor> {
-        self.tensors.values()
-    }
-
-    #[must_use]
-    pub fn tensor_count(&self) -> usize {
-        self.parameter_count
-    }
-
-    #[must_use]
-    pub fn metadata(&self) -> ModelMetadata {
-        ModelMetadata {
-            config: self.config.clone(),
-            tensor_count: self.parameter_count,
-        }
-    }
-
-    pub(crate) fn into_metadata(self) -> ModelMetadata {
-        ModelMetadata {
-            config: self.config,
-            tensor_count: self.parameter_count,
-        }
+    #[cfg(test)]
+    fn tensor_count(&self) -> usize {
+        self.tensors.len()
     }
 
     pub(crate) fn take_tensor(&mut self, name: &str) -> Option<Tensor> {
@@ -270,7 +240,7 @@ fn parse_tensor(
     let data = match header.type_code {
         TYPE_INT8 => {
             ensure_payload(&name, header.data_len, element_count)?;
-            TensorData::Bytes(payload[..element_count].to_vec())
+            TensorData::Bytes
         }
         TYPE_FLOAT32 => {
             let byte_count = element_count

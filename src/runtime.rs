@@ -1,8 +1,8 @@
 use crate::asset::{ModelAssets, VocabularyAssets};
 use crate::decoding::{self, DecodeOptions};
 use crate::error::{LoadError, TranslateError};
-use crate::inference::Network;
-use crate::model::{ModelArchive, ModelMetadata, Shortlist};
+use crate::inference::{Network, compile};
+use crate::model::{ModelArchive, Shortlist};
 use crate::text::{TokenId, Vocabulary};
 
 /// Options which control loading and preparation of a model.
@@ -13,6 +13,7 @@ pub struct LoadOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StopReason {
     EndOfSentence,
     LengthLimit,
@@ -28,7 +29,6 @@ pub struct Translation {
 
 /// A loaded translation runtime.
 pub struct Translator {
-    metadata: ModelMetadata,
     network: Network,
     source_vocab: Vocabulary,
     target_vocab: Vocabulary,
@@ -85,7 +85,7 @@ impl Translator {
         }
         shortlist.validate_target_vocab(target_vocab.len())?;
 
-        let (network, metadata) = Network::compile(model)?;
+        let network = compile(model)?;
 
         #[cfg(not(target_family = "wasm"))]
         let execution = rayon::ThreadPoolBuilder::new()
@@ -95,7 +95,6 @@ impl Translator {
             .map_err(|err| LoadError::ThreadPool(err.to_string()))?;
 
         Ok(Self {
-            metadata,
             network,
             source_vocab,
             target_vocab,
@@ -106,26 +105,6 @@ impl Translator {
             #[cfg(not(target_family = "wasm"))]
             execution,
         })
-    }
-
-    #[must_use]
-    pub fn metadata(&self) -> &ModelMetadata {
-        &self.metadata
-    }
-
-    #[must_use]
-    pub fn shortlist(&self) -> &Shortlist {
-        &self.shortlist
-    }
-
-    #[must_use]
-    pub fn source_vocab(&self) -> &Vocabulary {
-        &self.source_vocab
-    }
-
-    #[must_use]
-    pub fn target_vocab(&self) -> &Vocabulary {
-        &self.target_vocab
     }
 
     /// Translate one sentence using deterministic greedy or beam decoding.

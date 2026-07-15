@@ -11,7 +11,7 @@ pub type TokenId = u32;
 /// Keeping the third-party processor private prevents its filesystem helpers
 /// and usize-based IDs from leaking into the core inference interfaces.
 #[derive(Clone, Debug)]
-pub struct Vocabulary {
+pub(crate) struct Vocabulary {
     processor: SentencePieceProcessor,
 }
 
@@ -21,7 +21,7 @@ impl Vocabulary {
     /// # Errors
     ///
     /// Returns an error if decompression or model parsing fails.
-    pub fn load(asset: Asset) -> Result<Self, LoadError> {
+    pub(crate) fn load(asset: Asset) -> Result<Self, LoadError> {
         let bytes = asset.decode()?;
         let processor = SentencePieceProcessor::from_serialized_model(&bytes)
             .map_err(|err| LoadError::InvalidSentencePiece(err.to_string()))?;
@@ -34,22 +34,17 @@ impl Vocabulary {
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.processor.model().vocab_size()
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[must_use]
-    pub fn eos_id(&self) -> Option<TokenId> {
+    pub(crate) fn eos_id(&self) -> Option<TokenId> {
         self.processor.eos_id().map(|id| id as TokenId)
     }
 
     #[must_use]
-    pub fn unk_id(&self) -> TokenId {
+    pub(crate) fn unk_id(&self) -> TokenId {
         self.processor.unk_id() as TokenId
     }
 
@@ -59,7 +54,11 @@ impl Vocabulary {
     ///
     /// Returns an error if `SentencePiece` encoding fails or EOS was requested
     /// but the model has no EOS token.
-    pub fn encode(&self, input: &str, add_eos: bool) -> Result<Vec<TokenId>, TranslateError> {
+    pub(crate) fn encode(
+        &self,
+        input: &str,
+        add_eos: bool,
+    ) -> Result<Vec<TokenId>, TranslateError> {
         let mut ids = self
             .processor
             .encode_to_ids(input)
@@ -81,21 +80,10 @@ impl Vocabulary {
     /// # Errors
     ///
     /// Returns an error if `SentencePiece` rejects the IDs.
-    pub fn decode(&self, ids: &[TokenId]) -> Result<String, TranslateError> {
+    pub(crate) fn decode(&self, ids: &[TokenId]) -> Result<String, TranslateError> {
         let ids = ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
         self.processor
             .decode_ids(&ids)
-            .map_err(|err| TranslateError::Tokenization(err.to_string()))
-    }
-
-    /// Return the serialized piece associated with an ID.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the ID is outside the vocabulary.
-    pub fn piece(&self, id: TokenId) -> Result<&str, TranslateError> {
-        self.processor
-            .id_to_piece(id as usize)
             .map_err(|err| TranslateError::Tokenization(err.to_string()))
     }
 }

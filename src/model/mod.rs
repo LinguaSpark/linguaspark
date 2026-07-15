@@ -2,6 +2,6 @@ mod binary;
 mod config;
 mod shortlist;
 
-pub use binary::{ModelArchive, ModelMetadata, Tensor, TensorData, TensorType};
-pub use config::ModelConfig;
-pub use shortlist::Shortlist;
+pub(crate) use binary::{ModelArchive, Tensor, TensorData};
+pub(crate) use config::ModelConfig;
+pub(crate) use shortlist::Shortlist;
