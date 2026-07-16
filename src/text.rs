@@ -1,6 +1,5 @@
 use sentencepiece_rs::SentencePieceProcessor;
 
-use crate::asset::Asset;
 use crate::error::{LoadError, TranslateError};
 
 /// A vocabulary ID used at the public `LinguaSpark` boundary.
@@ -20,9 +19,8 @@ impl Vocabulary {
     ///
     /// # Errors
     ///
-    /// Returns an error if decompression or model parsing fails.
-    pub(crate) fn load(asset: Asset) -> Result<Self, LoadError> {
-        let bytes = asset.decode()?;
+    /// Returns an error if model parsing fails.
+    pub(crate) fn load(bytes: Vec<u8>) -> Result<Self, LoadError> {
         let processor = SentencePieceProcessor::from_serialized_model(&bytes)
             .map_err(|err| LoadError::InvalidSentencePiece(err.to_string()))?;
         if processor.model().vocab_size() > TokenId::MAX as usize {
@@ -90,12 +88,10 @@ impl Vocabulary {
 
 #[cfg(test)]
 mod tests {
-    use crate::asset::Asset;
-
     use super::Vocabulary;
 
     #[test]
     fn rejects_invalid_sentencepiece_model() {
-        assert!(Vocabulary::load(Asset::raw(b"not sentencepiece".to_vec())).is_err());
+        assert!(Vocabulary::load(b"not sentencepiece".to_vec()).is_err());
     }
 }

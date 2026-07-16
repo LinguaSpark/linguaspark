@@ -1,11 +1,7 @@
-use std::collections::HashMap;
-use std::io::Read;
-
-use sha2::{Digest, Sha256};
-
-use crate::asset::Asset;
 use crate::error::LoadError;
 use crate::model::ModelConfig;
+use std::collections::HashMap;
+use std::io::{Cursor, Read};
 
 const BINARY_FILE_VERSION: u64 = 1;
 const TYPE_INT8: u64 = 0x0101;
@@ -80,10 +76,9 @@ impl ModelArchive {
     ///
     /// # Errors
     ///
-    /// Returns an error if decompression, integrity verification, binary
-    /// parsing or basic configuration validation fails.
-    pub(crate) fn load(asset: Asset, expected_sha256: Option<[u8; 32]>) -> Result<Self, LoadError> {
-        let mut reader = HashingReader::new(asset.into_reader());
+    /// Returns an error if binary parsing or basic configuration validation fails.
+    pub(crate) fn load(bytes: Vec<u8>) -> Result<Self, LoadError> {
+        let mut reader = Cursor::new(bytes);
 
         let version = read_u64(&mut reader)?;
         if version != BINARY_FILE_VERSION {
@@ -103,7 +98,7 @@ impl ModelArchive {
         let mut config = None;
         for ((header, name), shape) in headers.iter().zip(names).zip(shapes) {
             let mut payload = vec![0; header.data_len];
-            reader.read_exact(&mut payload)?;
+            reader.read_exact(&mut payload).map_err(invalid_model_io)?;
 
             if name == "special:model.yml" {
                 let yaml = trim_nul(&payload);
@@ -120,23 +115,11 @@ impl ModelArchive {
             }
         }
 
-        // Ensure the gzip stream has reached EOF and include any trailer bytes
-        // in integrity verification performed by the decoder.
         let mut trailing = [0; 1];
-        if reader.read(&mut trailing)? != 0 {
+        if reader.read(&mut trailing).map_err(invalid_model_io)? != 0 {
             return Err(LoadError::InvalidModel(
                 "trailing bytes after Marian payload".into(),
             ));
-        }
-
-        let actual_hash: [u8; 32] = reader.finalize().into();
-        if let Some(expected) = expected_sha256
-            && actual_hash != expected
-        {
-            return Err(LoadError::HashMismatch {
-                expected: hex(&expected),
-                actual: hex(&actual_hash),
-            });
         }
 
         let config = config
@@ -191,7 +174,7 @@ fn read_names(reader: &mut impl Read, headers: &[Header]) -> Result<Vec<String>,
                 )));
             }
             let mut bytes = vec![0; header.name_len];
-            reader.read_exact(&mut bytes)?;
+            reader.read_exact(&mut bytes).map_err(invalid_model_io)?;
             if bytes.pop() != Some(0) {
                 return Err(LoadError::InvalidModel(
                     "tensor name is not NUL terminated".into(),
@@ -290,41 +273,15 @@ fn parse_tensor(
     Ok(Tensor { name, shape, data })
 }
 
-struct HashingReader<R> {
-    inner: R,
-    hasher: Sha256,
-}
-
-impl<R> HashingReader<R> {
-    fn new(inner: R) -> Self {
-        Self {
-            inner,
-            hasher: Sha256::new(),
-        }
-    }
-
-    fn finalize(self) -> sha2::digest::Output<Sha256> {
-        self.hasher.finalize()
-    }
-}
-
-impl<R: Read> Read for HashingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let count = self.inner.read(buf)?;
-        self.hasher.update(&buf[..count]);
-        Ok(count)
-    }
-}
-
 fn read_u64(reader: &mut impl Read) -> Result<u64, LoadError> {
     let mut bytes = [0; 8];
-    reader.read_exact(&mut bytes)?;
+    reader.read_exact(&mut bytes).map_err(invalid_model_io)?;
     Ok(u64::from_le_bytes(bytes))
 }
 
 fn read_i32(reader: &mut impl Read) -> Result<i32, LoadError> {
     let mut bytes = [0; 4];
-    reader.read_exact(&mut bytes)?;
+    reader.read_exact(&mut bytes).map_err(invalid_model_io)?;
     Ok(i32::from_le_bytes(bytes))
 }
 
@@ -338,10 +295,16 @@ fn copy_to_sink(reader: &mut impl Read, len: usize) -> Result<(), LoadError> {
     let mut buffer = [0; 4096];
     while remaining > 0 {
         let chunk = remaining.min(buffer.len());
-        reader.read_exact(&mut buffer[..chunk])?;
+        reader
+            .read_exact(&mut buffer[..chunk])
+            .map_err(invalid_model_io)?;
         remaining -= chunk;
     }
     Ok(())
+}
+
+fn invalid_model_io(error: std::io::Error) -> LoadError {
+    LoadError::InvalidModel(format!("truncated or unreadable binary data: {error}"))
 }
 
 fn checked_elements(shape: &[usize]) -> Result<usize, LoadError> {
@@ -368,26 +331,8 @@ fn trim_nul(bytes: &[u8]) -> &[u8] {
     bytes.strip_suffix(&[0]).unwrap_or(bytes)
 }
 
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0xf) as usize] as char);
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
-    use sha2::{Digest, Sha256};
-
-    use crate::asset::Asset;
-
     use super::{ModelArchive, TYPE_FLOAT32, TYPE_INTGEMM8, TensorData, TensorType};
 
     struct Item {
@@ -467,26 +412,15 @@ version: test
 
     #[test]
     fn loads_minimal_raw_archive() {
-        let archive = ModelArchive::load(Asset::raw(build(vec![], 0)), None).unwrap();
+        let archive = ModelArchive::load(build(vec![], 0)).unwrap();
         assert_eq!(archive.config.version, "test");
         assert_eq!(archive.tensor_count(), 0);
     }
 
     #[test]
-    fn loads_gzip_archive() {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&build(vec![], 0)).unwrap();
-        let archive = ModelArchive::load(Asset::gzip(encoder.finish().unwrap()), None).unwrap();
-        assert_eq!(archive.config.dim_emb, 4);
-    }
-
-    #[test]
     fn parses_float32_tensor() {
-        let archive = ModelArchive::load(
-            Asset::raw(build(vec![float_item("weight", &[1.5, -2.0])], 0)),
-            None,
-        )
-        .unwrap();
+        let archive =
+            ModelArchive::load(build(vec![float_item("weight", &[1.5, -2.0])], 0)).unwrap();
         let TensorData::F32(values) = &archive.tensor("weight").unwrap().data else {
             panic!("expected float tensor")
         };
@@ -501,18 +435,15 @@ version: test
     fn parses_intgemm8_tensor_and_multiplier() {
         let mut payload = vec![1u8, 255];
         payload.extend_from_slice(&2.5f32.to_le_bytes());
-        let archive = ModelArchive::load(
-            Asset::raw(build(
-                vec![Item {
-                    name: "weight".into(),
-                    type_code: TYPE_INTGEMM8,
-                    shape: vec![2],
-                    payload,
-                }],
-                0,
-            )),
-            None,
-        )
+        let archive = ModelArchive::load(build(
+            vec![Item {
+                name: "weight".into(),
+                type_code: TYPE_INTGEMM8,
+                shape: vec![2],
+                payload,
+            }],
+            0,
+        ))
         .unwrap();
         let TensorData::QuantizedI8 { values, multiplier } =
             &archive.tensor("weight").unwrap().data
@@ -531,7 +462,7 @@ version: test
     fn accepts_header_and_tensor_payload_padding() {
         let mut item = float_item("weight", &[1.0]);
         item.payload.extend_from_slice(&[0; 12]);
-        let archive = ModelArchive::load(Asset::raw(build(vec![item], 13)), None).unwrap();
+        let archive = ModelArchive::load(build(vec![item], 13)).unwrap();
         assert!(archive.tensor("weight").is_some());
     }
 
@@ -539,7 +470,7 @@ version: test
     fn rejects_invalid_version_type_and_short_payload() {
         let mut version = build(vec![], 0);
         version[..8].copy_from_slice(&2u64.to_le_bytes());
-        assert!(ModelArchive::load(Asset::raw(version), None).is_err());
+        assert!(ModelArchive::load(version).is_err());
 
         let invalid_type = Item {
             name: "weight".into(),
@@ -547,7 +478,7 @@ version: test
             shape: vec![1],
             payload: vec![0],
         };
-        assert!(ModelArchive::load(Asset::raw(build(vec![invalid_type], 0)), None).is_err());
+        assert!(ModelArchive::load(build(vec![invalid_type], 0)).is_err());
 
         let short = Item {
             name: "weight".into(),
@@ -555,7 +486,7 @@ version: test
             shape: vec![2],
             payload: 1.0f32.to_le_bytes().to_vec(),
         };
-        assert!(ModelArchive::load(Asset::raw(build(vec![short], 0)), None).is_err());
+        assert!(ModelArchive::load(build(vec![short], 0)).is_err());
     }
 
     #[test]
@@ -564,29 +495,25 @@ version: test
             vec![float_item("weight", &[1.0]), float_item("weight", &[2.0])],
             0,
         );
-        assert!(ModelArchive::load(Asset::raw(duplicate), None).is_err());
+        assert!(ModelArchive::load(duplicate).is_err());
 
         let mut trailing = build(vec![], 0);
         trailing.push(0);
-        assert!(ModelArchive::load(Asset::raw(trailing), None).is_err());
+        assert!(ModelArchive::load(trailing).is_err());
     }
 
     #[test]
-    fn verifies_hash_and_rejects_malformed_name_or_shape() {
+    fn rejects_malformed_name_or_shape() {
         let bytes = build(vec![], 0);
-        let hash: [u8; 32] = Sha256::digest(&bytes).into();
-        ModelArchive::load(Asset::raw(bytes.clone()), Some(hash)).unwrap();
-        assert!(ModelArchive::load(Asset::raw(bytes.clone()), Some([0; 32])).is_err());
-
         let mut bad_name = bytes.clone();
         let names_start = 16 + 32;
         let name_end = names_start + "special:model.yml".len();
         bad_name[name_end] = b'x';
-        assert!(ModelArchive::load(Asset::raw(bad_name), None).is_err());
+        assert!(ModelArchive::load(bad_name).is_err());
 
         let mut bad_shape = bytes;
         let shape_start = names_start + "special:model.yml".len() + 1;
         bad_shape[shape_start..shape_start + 4].copy_from_slice(&0i32.to_le_bytes());
-        assert!(ModelArchive::load(Asset::raw(bad_shape), None).is_err());
+        assert!(ModelArchive::load(bad_shape).is_err());
     }
 }

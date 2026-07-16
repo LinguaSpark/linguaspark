@@ -6,7 +6,6 @@ license = "MIT"
 description = "Pure Rust inference for Bergamot-compatible Marian translation models"
 
 [dependencies]
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 rten-gemm = "0.24"
 rten-simd = "0.24"
 rten-tensor = "0.24"
@@ -14,7 +13,6 @@ rten-vecmath = "0.24"
 rayon = "1"
 sentencepiece-rs = "0.2.2"
 serde = { version = "1", features = ["derive"] }
-sha2 = "0.10"
 thiserror = "2"
 yaml_serde = "0.10"
 

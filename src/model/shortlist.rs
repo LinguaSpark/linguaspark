@@ -1,4 +1,3 @@
-use crate::asset::Asset;
 use crate::error::LoadError;
 
 const BINARY_SHORTLIST_MAGIC: u64 = 0xF11A_48D5_0134_17F5;
@@ -18,8 +17,7 @@ impl Shortlist {
     ///
     /// Returns an error for malformed headers, invalid offsets or a checksum
     /// mismatch.
-    pub(crate) fn load(asset: Asset) -> Result<Self, LoadError> {
-        let bytes = asset.decode()?;
+    pub(crate) fn load(bytes: Vec<u8>) -> Result<Self, LoadError> {
         if bytes.len() < 48 {
             return Err(LoadError::InvalidShortlist(format!(
                 "invalid byte length {}",
@@ -225,8 +223,6 @@ fn marian_hash_u64(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::asset::Asset;
-
     use super::{BINARY_SHORTLIST_MAGIC, Shortlist, marian_hash_u64};
 
     fn binary(first_num: u64, best_num: u64, offsets: &[u64], ids: &[u32]) -> Vec<u8> {
@@ -249,7 +245,7 @@ mod tests {
     }
 
     fn load(bytes: Vec<u8>) -> Result<Shortlist, crate::error::LoadError> {
-        Shortlist::load(Asset::raw(bytes))
+        Shortlist::load(bytes)
     }
 
     #[test]

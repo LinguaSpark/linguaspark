@@ -5,25 +5,32 @@ use crate::inference::{Network, compile};
 use crate::model::{ModelArchive, Shortlist};
 use crate::text::{TokenId, Vocabulary};
 
-/// Options which control loading and preparation of a model.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LoadOptions {
-    /// Expected SHA-256 of the uncompressed Marian model.
-    pub expected_model_sha256: Option<[u8; 32]>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+/// The condition that stopped decoding.
 pub enum StopReason {
+    /// The decoder emitted the end-of-sentence token.
     EndOfSentence,
+    /// Decoding reached the configured maximum output length.
     LengthLimit,
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
+/// The best translation produced for one input.
 pub struct Translation {
+    /// Decoded target text.
     pub text: String,
+
+    /// Generated target token IDs, excluding the end-of-sentence token.
     pub token_ids: Vec<TokenId>,
+
+    /// Final hypothesis score after length normalization and word penalty.
+    ///
+    /// This is not a calibrated probability or confidence score.
     pub score: f32,
+
+    /// Why decoding stopped.
     pub stop_reason: StopReason,
 }
 
@@ -47,14 +54,14 @@ impl Translator {
     ///
     /// Returns an error when an asset is malformed, the vocabularies and
     /// shortlist do not match the model, or the model uses unsupported layers.
-    pub fn from_assets(assets: ModelAssets, options: LoadOptions) -> Result<Self, LoadError> {
-        let model = ModelArchive::load(assets.model, options.expected_model_sha256)?;
+    pub fn from_assets(assets: ModelAssets) -> Result<Self, LoadError> {
+        let model = ModelArchive::load(assets.model)?;
         let (source_vocab, target_vocab, shared_vocab) = match assets.vocabularies {
-            VocabularyAssets::Shared(asset) => {
-                let vocabulary = Vocabulary::load(asset)?;
+            VocabularyAssets::Shared(bytes) => {
+                let vocabulary = Vocabulary::load(bytes)?;
                 (vocabulary.clone(), vocabulary, true)
             }
-            VocabularyAssets::Split { source, target } => {
+            VocabularyAssets::Separate { source, target } => {
                 (Vocabulary::load(source)?, Vocabulary::load(target)?, false)
             }
         };

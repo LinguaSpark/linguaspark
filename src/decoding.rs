@@ -4,11 +4,17 @@ use crate::text::TokenId;
 
 /// Controls greedy and beam decoding.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DecodeOptions {
+    /// Number of hypotheses retained during beam search.
     pub beam_size: usize,
+    /// Maximum output length as a multiple of the padded source length.
     pub max_length_factor: f32,
+    /// Whether the decoder may emit the unknown token.
     pub allow_unknown: bool,
+    /// Exponent used to normalize scores by output length.
     pub length_normalization: f32,
+    /// Score added for each generated token.
     pub word_penalty: f32,
 }
 

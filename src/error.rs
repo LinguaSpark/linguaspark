@@ -1,41 +1,43 @@
-use std::io;
-
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
+/// An error encountered while loading a translation model.
 pub enum LoadError {
-    #[error("failed to read an asset: {0}")]
-    Io(#[from] io::Error),
-
+    /// The Marian model is malformed or inconsistent.
     #[error("invalid Marian model: {0}")]
     InvalidModel(String),
 
-    #[error("model SHA-256 mismatch: expected {expected}, got {actual}")]
-    HashMismatch { expected: String, actual: String },
-
+    /// The model uses an architecture or feature that is not supported.
     #[error("unsupported model architecture: {0}")]
     UnsupportedArchitecture(String),
 
+    /// The lexical shortlist is malformed or inconsistent.
     #[error("invalid lexical shortlist: {0}")]
     InvalidShortlist(String),
 
+    /// A SentencePiece vocabulary is malformed or incompatible.
     #[error("invalid SentencePiece model: {0}")]
     InvalidSentencePiece(String),
 
+    /// The native translation execution context could not be created.
     #[error("failed to create translation execution context: {0}")]
     ThreadPool(String),
 }
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
+/// An error encountered while translating text.
 pub enum TranslateError {
+    /// The input or decode options are invalid.
     #[error("invalid translation input: {0}")]
     InvalidInput(String),
 
+    /// Source encoding or target decoding failed.
     #[error("tokenization failed: {0}")]
     Tokenization(String),
 
+    /// Model inference failed.
     #[error("inference failed: {0}")]
     Inference(String),
 }
