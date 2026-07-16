@@ -12,6 +12,6 @@ mod text;
 
 pub use asset::{ModelAssets, VocabularyAssets};
 pub use decoding::DecodeOptions;
-pub use error::{LoadError, TranslateError};
-pub use runtime::{StopReason, Translation, Translator};
+pub use error::{ExecutorError, LoadError, TranslateError};
+pub use runtime::{Executor, Model, StopReason, Translation};
 pub use text::TokenId;

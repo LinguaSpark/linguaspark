@@ -1,9 +1,10 @@
 use crate::asset::{ModelAssets, VocabularyAssets};
 use crate::decoding::{self, DecodeOptions};
-use crate::error::{LoadError, TranslateError};
+use crate::error::{ExecutorError, LoadError, TranslateError};
 use crate::inference::{Network, compile};
 use crate::model::{ModelArchive, Shortlist};
 use crate::text::{TokenId, Vocabulary};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -34,20 +35,62 @@ pub struct Translation {
     pub stop_reason: StopReason,
 }
 
-/// A loaded translation runtime.
-pub struct Translator {
+/// A loaded, immutable translation model.
+///
+/// Cloning a model is inexpensive and shares the compiled model data.
+#[derive(Clone)]
+pub struct Model {
+    inner: Arc<ModelInner>,
+}
+
+struct ModelInner {
     network: Network,
-    source_vocab: Vocabulary,
-    target_vocab: Vocabulary,
+    vocabularies: Vocabularies,
     shortlist: Shortlist,
-    shared_vocab: bool,
     source_eos: TokenId,
     target_eos: TokenId,
+}
+
+enum Vocabularies {
+    Shared(Box<Vocabulary>),
+    Separate {
+        source: Box<Vocabulary>,
+        target: Box<Vocabulary>,
+    },
+}
+
+impl Vocabularies {
+    fn source(&self) -> &Vocabulary {
+        match self {
+            Self::Shared(vocabulary) => vocabulary,
+            Self::Separate { source, .. } => source,
+        }
+    }
+
+    fn target(&self) -> &Vocabulary {
+        match self {
+            Self::Shared(vocabulary) => vocabulary,
+            Self::Separate { target, .. } => target,
+        }
+    }
+
+    fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared(_))
+    }
+}
+
+/// A single-threaded inference execution slot.
+///
+/// Executors do not own model weights and may run any [`Model`]. Callers that
+/// want parallel inference should create multiple executors. Translation
+/// requires exclusive access to make the single-operation capacity explicit
+/// and to permit future reuse of executor-local workspace.
+pub struct Executor {
     #[cfg(not(target_family = "wasm"))]
     execution: rayon::ThreadPool,
 }
 
-impl Translator {
+impl Model {
     /// Load all model assets from owned byte buffers.
     ///
     /// # Errors
@@ -56,59 +99,71 @@ impl Translator {
     /// shortlist do not match the model, or the model uses unsupported layers.
     pub fn from_assets(assets: ModelAssets) -> Result<Self, LoadError> {
         let model = ModelArchive::load(assets.model)?;
-        let (source_vocab, target_vocab, shared_vocab) = match assets.vocabularies {
+        let vocabularies = match assets.vocabularies {
             VocabularyAssets::Shared(bytes) => {
-                let vocabulary = Vocabulary::load(bytes)?;
-                (vocabulary.clone(), vocabulary, true)
+                Vocabularies::Shared(Box::new(Vocabulary::load(bytes)?))
             }
-            VocabularyAssets::Separate { source, target } => {
-                (Vocabulary::load(source)?, Vocabulary::load(target)?, false)
-            }
+            VocabularyAssets::Separate { source, target } => Vocabularies::Separate {
+                source: Box::new(Vocabulary::load(source)?),
+                target: Box::new(Vocabulary::load(target)?),
+            },
         };
-        let source_eos = source_vocab.eos_id().ok_or_else(|| {
+        let source_eos = vocabularies.source().eos_id().ok_or_else(|| {
             LoadError::InvalidSentencePiece("source vocabulary has no EOS token".into())
         })?;
-        let target_eos = target_vocab.eos_id().ok_or_else(|| {
+        let target_eos = vocabularies.target().eos_id().ok_or_else(|| {
             LoadError::InvalidSentencePiece("target vocabulary has no EOS token".into())
         })?;
         let shortlist = Shortlist::load(assets.shortlist)?;
-        if source_vocab.len() != model.config.dim_vocabs[0]
-            || target_vocab.len() != model.config.dim_vocabs[1]
+        if vocabularies.source().len() != model.config.dim_vocabs[0]
+            || vocabularies.target().len() != model.config.dim_vocabs[1]
         {
             return Err(LoadError::InvalidModel(format!(
                 "vocabulary sizes ({}, {}) do not match model dimensions ({}, {})",
-                source_vocab.len(),
-                target_vocab.len(),
+                vocabularies.source().len(),
+                vocabularies.target().len(),
                 model.config.dim_vocabs[0],
                 model.config.dim_vocabs[1]
             )));
         }
-        if shortlist.source_vocab_size() != source_vocab.len() {
+        if shortlist.source_vocab_size() != vocabularies.source().len() {
             return Err(LoadError::InvalidShortlist(format!(
                 "shortlist source vocabulary size {} does not match source vocabulary {}",
                 shortlist.source_vocab_size(),
-                source_vocab.len()
+                vocabularies.source().len()
             )));
         }
-        shortlist.validate_target_vocab(target_vocab.len())?;
+        shortlist.validate_target_vocab(vocabularies.target().len())?;
 
         let network = compile(model)?;
 
+        Ok(Self {
+            inner: Arc::new(ModelInner {
+                network,
+                vocabularies,
+                shortlist,
+                source_eos,
+                target_eos,
+            }),
+        })
+    }
+}
+
+impl Executor {
+    /// Create a single-threaded inference executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the native execution context cannot be created.
+    pub fn new() -> Result<Self, ExecutorError> {
         #[cfg(not(target_family = "wasm"))]
         let execution = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
-            .thread_name(|_| "linguaspark-translator".into())
+            .thread_name(|_| "linguaspark-executor".into())
             .build()
-            .map_err(|err| LoadError::ThreadPool(err.to_string()))?;
+            .map_err(|err| ExecutorError::ThreadPool(err.to_string()))?;
 
         Ok(Self {
-            network,
-            source_vocab,
-            target_vocab,
-            shortlist,
-            shared_vocab,
-            source_eos,
-            target_eos,
             #[cfg(not(target_family = "wasm"))]
             execution,
         })
@@ -121,12 +176,13 @@ impl Translator {
     /// Returns an error for invalid decode options, tokenization failures or
     /// inference failures.
     pub fn translate(
-        &self,
+        &mut self,
+        model: &Model,
         input: &str,
         options: &DecodeOptions,
     ) -> Result<Translation, TranslateError> {
         self.execute(|| {
-            let mut translations = self.translate_batch_inner(&[input], options)?;
+            let mut translations = translate_batch_inner(&model.inner, &[input], options)?;
             Ok(translations
                 .pop()
                 .expect("single-input batch returned empty"))
@@ -135,7 +191,7 @@ impl Translator {
 
     /// Translate a tensor batch using Marian-compatible padding and beam search.
     ///
-    /// The caller controls request scheduling. A `Translator` is one synchronous
+    /// The caller controls request scheduling. An executor is one synchronous
     /// execution unit and processes the supplied slice as a single padded batch.
     ///
     /// # Errors
@@ -143,65 +199,13 @@ impl Translator {
     /// Returns an error for invalid decode options, tokenization failures or
     /// inference failures.
     pub fn translate_batch<S: AsRef<str>>(
-        &self,
+        &mut self,
+        model: &Model,
         inputs: &[S],
         options: &DecodeOptions,
     ) -> Result<Vec<Translation>, TranslateError> {
         let inputs = inputs.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-        self.execute(move || self.translate_batch_inner(&inputs, options))
-    }
-
-    fn translate_batch_inner<S: AsRef<str>>(
-        &self,
-        inputs: &[S],
-        options: &DecodeOptions,
-    ) -> Result<Vec<Translation>, TranslateError> {
-        validate_decode_options(options)?;
-        if inputs.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let sources = inputs
-            .iter()
-            .map(|input| self.source_vocab.encode(input.as_ref(), true))
-            .collect::<Result<Vec<_>, _>>()?;
-        let (padded, mask, width, empty_inputs) = pad_sources(&sources, self.source_eos);
-        let batch_size = sources.len();
-        let shortlist =
-            self.shortlist
-                .generate_shared(&padded, self.target_vocab.len(), self.shared_vocab);
-        let output = self.network.prepare_output(&shortlist)?;
-        let encoded = self
-            .network
-            .encode_batch(&padded, &mask, batch_size, width)?;
-        let max_len = ((width as f32) * options.max_length_factor).ceil().max(1.0) as usize;
-        let decoded = decoding::decode_batch(decoding::DecodeBatchRequest {
-            network: &self.network,
-            encoded: &encoded,
-            output: &output,
-            shortlist: &shortlist,
-            forbidden: (!options.allow_unknown).then(|| self.target_vocab.unk_id()),
-            eos: self.target_eos,
-            empty_inputs: &empty_inputs,
-            max_len,
-            options,
-        })?;
-        decoded
-            .into_iter()
-            .map(|best| {
-                let text = self.target_vocab.decode(&best.tokens)?;
-                Ok(Translation {
-                    text,
-                    token_ids: best.tokens,
-                    score: best.score,
-                    stop_reason: if best.finished {
-                        StopReason::EndOfSentence
-                    } else {
-                        StopReason::LengthLimit
-                    },
-                })
-            })
-            .collect()
+        self.execute(move || translate_batch_inner(&model.inner, &inputs, options))
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -213,6 +217,61 @@ impl Translator {
     fn execute<R>(&self, operation: impl FnOnce() -> R) -> R {
         operation()
     }
+}
+
+fn translate_batch_inner<S: AsRef<str>>(
+    model: &ModelInner,
+    inputs: &[S],
+    options: &DecodeOptions,
+) -> Result<Vec<Translation>, TranslateError> {
+    validate_decode_options(options)?;
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sources = inputs
+        .iter()
+        .map(|input| model.vocabularies.source().encode(input.as_ref(), true))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (padded, mask, width, empty_inputs) = pad_sources(&sources, model.source_eos);
+    let batch_size = sources.len();
+    let shortlist = model.shortlist.generate_shared(
+        &padded,
+        model.vocabularies.target().len(),
+        model.vocabularies.is_shared(),
+    );
+    let output = model.network.prepare_output(&shortlist)?;
+    let encoded = model
+        .network
+        .encode_batch(&padded, &mask, batch_size, width)?;
+    let max_len = ((width as f32) * options.max_length_factor).ceil().max(1.0) as usize;
+    let decoded = decoding::decode_batch(decoding::DecodeBatchRequest {
+        network: &model.network,
+        encoded: &encoded,
+        output: &output,
+        shortlist: &shortlist,
+        forbidden: (!options.allow_unknown).then(|| model.vocabularies.target().unk_id()),
+        eos: model.target_eos,
+        empty_inputs: &empty_inputs,
+        max_len,
+        options,
+    })?;
+    decoded
+        .into_iter()
+        .map(|best| {
+            let text = model.vocabularies.target().decode(&best.tokens)?;
+            Ok(Translation {
+                text,
+                token_ids: best.tokens,
+                score: best.score,
+                stop_reason: if best.finished {
+                    StopReason::EndOfSentence
+                } else {
+                    StopReason::LengthLimit
+                },
+            })
+        })
+        .collect()
 }
 
 fn pad_sources(
@@ -258,7 +317,31 @@ fn validate_decode_options(options: &DecodeOptions) -> Result<(), TranslateError
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeOptions, pad_sources, validate_decode_options};
+    use super::{DecodeOptions, Executor, Model, pad_sources, validate_decode_options};
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn public_runtime_types_have_expected_thread_safety() {
+        assert_send_sync::<Model>();
+        assert_send_sync::<Executor>();
+    }
+
+    #[test]
+    fn executor_uses_one_rayon_thread() {
+        let executor = Executor::new().unwrap();
+        assert_eq!(executor.execute(rayon::current_num_threads), 1);
+    }
+
+    #[test]
+    fn executor_survives_panicking_operation() {
+        let executor = Executor::new().unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            executor.execute(|| panic!("expected test panic"));
+        }));
+        assert!(panic.is_err());
+        assert_eq!(executor.execute(|| 42), 42);
+    }
 
     #[test]
     fn accepts_default_decode_options() {

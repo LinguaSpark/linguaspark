@@ -19,9 +19,14 @@ pub enum LoadError {
     /// A SentencePiece vocabulary is malformed or incompatible.
     #[error("invalid SentencePiece model: {0}")]
     InvalidSentencePiece(String),
+}
 
-    /// The native translation execution context could not be created.
-    #[error("failed to create translation execution context: {0}")]
+#[derive(Debug, Error)]
+#[non_exhaustive]
+/// An error encountered while creating an inference executor.
+pub enum ExecutorError {
+    /// The single-threaded Rayon execution context could not be created.
+    #[error("failed to create inference executor: {0}")]
     ThreadPool(String),
 }
 

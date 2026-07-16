@@ -9,7 +9,7 @@ pub type TokenId = u32;
 ///
 /// Keeping the third-party processor private prevents its filesystem helpers
 /// and usize-based IDs from leaking into the core inference interfaces.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Vocabulary {
     processor: SentencePieceProcessor,
 }
