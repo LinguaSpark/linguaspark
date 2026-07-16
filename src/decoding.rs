@@ -14,7 +14,7 @@ pub struct DecodeOptions {
     pub allow_unknown: bool,
     /// Exponent used to normalize scores by output length.
     pub length_normalization: f32,
-    /// Score added for each generated token.
+    /// Per-token value subtracted before length normalization.
     pub word_penalty: f32,
 }
 

@@ -1,7 +1,7 @@
 /// The assets needed by a Bergamot translation model.
 ///
 /// All bytes must be decompressed before they cross the core library boundary.
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct ModelAssets {
     /// Uncompressed Marian model bytes.
     pub model: Vec<u8>,
@@ -12,7 +12,7 @@ pub struct ModelAssets {
 }
 
 /// Vocabulary assets used by a translation model.
-#[derive(Debug)]
+#[derive(Clone)]
 pub enum VocabularyAssets {
     /// Source and target use the same vocabulary and token-ID space.
     Shared(Vec<u8>),
