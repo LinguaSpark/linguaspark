@@ -16,9 +16,8 @@ enum TensorType {
     IntGemm8,
 }
 
-#[derive(Debug)]
 pub(crate) enum TensorData {
-    Bytes,
+    Int8,
     F32(Vec<f32>),
     QuantizedI8 { values: Vec<i8>, multiplier: f32 },
 }
@@ -28,14 +27,13 @@ impl TensorData {
     #[must_use]
     fn tensor_type(&self) -> TensorType {
         match self {
-            Self::Bytes => TensorType::Int8,
+            Self::Int8 => TensorType::Int8,
             Self::F32(_) => TensorType::Float32,
             Self::QuantizedI8 { .. } => TensorType::IntGemm8,
         }
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct Tensor {
     pub(crate) name: String,
     pub(crate) shape: Vec<usize>,
@@ -57,13 +55,11 @@ impl Tensor {
 
 /// Parsed Marian binary archive before its tensors are consumed and packed by
 /// the inference runtime.
-#[derive(Debug)]
 pub(crate) struct ModelArchive {
     pub(crate) config: ModelConfig,
     tensors: HashMap<String, Tensor>,
 }
 
-#[derive(Debug)]
 struct Header {
     name_len: usize,
     type_code: u64,
@@ -223,7 +219,7 @@ fn parse_tensor(
     let data = match header.type_code {
         TYPE_INT8 => {
             ensure_payload(&name, header.data_len, element_count)?;
-            TensorData::Bytes
+            TensorData::Int8
         }
         TYPE_FLOAT32 => {
             let byte_count = element_count

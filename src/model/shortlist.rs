@@ -2,7 +2,6 @@ use crate::error::LoadError;
 
 const BINARY_SHORTLIST_MAGIC: u64 = 0xF11A_48D5_0134_17F5;
 
-#[derive(Debug)]
 pub(crate) struct Shortlist {
     /// Number of globally frequent target tokens included at runtime.
     first_num: usize,

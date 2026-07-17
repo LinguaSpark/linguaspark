@@ -287,7 +287,7 @@ fn take_scalar(model: &mut ModelArchive, name: &str) -> Result<f32, LoadError> {
         // Recovering its scalar value is therefore required by the on-disk
         // format; it is not a fallback for quantized network weights.
         TensorData::QuantizedI8 { values, multiplier } => Ok(f32::from(values[0]) / multiplier),
-        TensorData::Bytes => Err(LoadError::InvalidModel(format!(
+        TensorData::Int8 => Err(LoadError::InvalidModel(format!(
             "tensor {name} is not a numeric scalar"
         ))),
     }

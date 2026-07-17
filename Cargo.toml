@@ -15,7 +15,3 @@ sentencepiece-rs = "0.2.2"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 yaml_serde = "0.10"
-
-[profile.release]
-lto = "thin"
-codegen-units = 1
