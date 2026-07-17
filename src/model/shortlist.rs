@@ -11,11 +11,6 @@ pub(crate) struct Shortlist {
 
 impl Shortlist {
     /// Parse a Bergamot binary lexical shortlist.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for malformed headers, invalid offsets or a checksum
-    /// mismatch.
     pub(crate) fn load(bytes: Vec<u8>) -> Result<Self, LoadError> {
         if bytes.len() < 48 {
             return Err(LoadError::InvalidShortlist(format!(

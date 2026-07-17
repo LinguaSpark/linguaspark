@@ -79,24 +79,17 @@ impl Vocabularies {
     }
 }
 
-/// A single-threaded inference execution slot.
+/// A single-threaded inference executor.
 ///
-/// Executors do not own model weights and may run any [`Model`]. Callers that
-/// want parallel inference should create multiple executors. Translation
-/// requires exclusive access to make the single-operation capacity explicit
-/// and to permit future reuse of executor-local workspace.
+/// An executor may run any [`Model`]. Use multiple executors for concurrent
+/// translation.
 pub struct Executor {
     #[cfg(not(target_family = "wasm"))]
     execution: rayon::ThreadPool,
 }
 
 impl Model {
-    /// Load all model assets from owned byte buffers.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when an asset is malformed, the vocabularies and
-    /// shortlist do not match the model, or the model uses unsupported layers.
+    /// Load a model from owned assets.
     pub fn from_assets(assets: ModelAssets) -> Result<Self, LoadError> {
         let model = ModelArchive::load(assets.model)?;
         let vocabularies = match assets.vocabularies {
@@ -109,10 +102,10 @@ impl Model {
             },
         };
         let source_eos = vocabularies.source().eos_id().ok_or_else(|| {
-            LoadError::InvalidSentencePiece("source vocabulary has no EOS token".into())
+            LoadError::InvalidVocabulary("source vocabulary has no EOS token".into())
         })?;
         let target_eos = vocabularies.target().eos_id().ok_or_else(|| {
-            LoadError::InvalidSentencePiece("target vocabulary has no EOS token".into())
+            LoadError::InvalidVocabulary("target vocabulary has no EOS token".into())
         })?;
         let shortlist = Shortlist::load(assets.shortlist)?;
         if vocabularies.source().len() != model.config.dim_vocabs[0]
@@ -151,17 +144,13 @@ impl Model {
 
 impl Executor {
     /// Create a single-threaded inference executor.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the native execution context cannot be created.
     pub fn new() -> Result<Self, ExecutorError> {
         #[cfg(not(target_family = "wasm"))]
         let execution = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .thread_name(|_| "linguaspark-executor".into())
             .build()
-            .map_err(|err| ExecutorError::ThreadPool(err.to_string()))?;
+            .map_err(ExecutorError)?;
 
         Ok(Self {
             #[cfg(not(target_family = "wasm"))]
@@ -169,12 +158,7 @@ impl Executor {
         })
     }
 
-    /// Translate one sentence using deterministic greedy or beam decoding.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for invalid decode options, tokenization failures or
-    /// inference failures.
+    /// Translate one sentence using greedy or beam decoding.
     pub fn translate(
         &mut self,
         model: &Model,
@@ -189,15 +173,7 @@ impl Executor {
         })
     }
 
-    /// Translate a tensor batch using Marian-compatible padding and beam search.
-    ///
-    /// The caller controls request scheduling. An executor is one synchronous
-    /// execution unit and processes the supplied slice as a single padded batch.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for invalid decode options, tokenization failures or
-    /// inference failures.
+    /// Translate sentences as one padded inference batch.
     pub fn translate_batch<S: AsRef<str>>(
         &mut self,
         model: &Model,
@@ -298,17 +274,17 @@ fn pad_sources(
 
 fn validate_decode_options(options: &DecodeOptions) -> Result<(), TranslateError> {
     if !options.max_length_factor.is_finite() || options.max_length_factor <= 0.0 {
-        return Err(TranslateError::InvalidInput(
+        return Err(TranslateError::InvalidOptions(
             "max_length_factor must be positive and finite".into(),
         ));
     }
     if options.beam_size == 0 {
-        return Err(TranslateError::InvalidInput(
+        return Err(TranslateError::InvalidOptions(
             "beam_size must be at least one".into(),
         ));
     }
     if !options.length_normalization.is_finite() || !options.word_penalty.is_finite() {
-        return Err(TranslateError::InvalidInput(
+        return Err(TranslateError::InvalidOptions(
             "decode score options must be finite".into(),
         ));
     }

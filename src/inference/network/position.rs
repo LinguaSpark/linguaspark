@@ -1,17 +1,37 @@
-pub(super) fn add_sequence(values: &mut [f32], rows: usize, start: usize, dim: usize) {
+fn add_position(
+    values: &mut [f32],
+    offset: usize,
+    position: f32,
+    dim: usize,
+    timescales: usize,
+    embedding_scale: f32,
+    log_increment: f32,
+) {
+    for index in 0..dim {
+        values[offset + index] *= embedding_scale;
+    }
+    for index in 0..timescales {
+        let angle = position * (-(index as f32) * log_increment).exp();
+        values[offset + index] += angle.sin();
+        values[offset + timescales + index] += angle.cos();
+    }
+}
+
+fn add_sequence(values: &mut [f32], rows: usize, start: usize, dim: usize) {
     let embedding_scale = (dim as f32).sqrt();
     let timescales = dim / 2;
     let log_increment = 10_000.0f32.ln() / (timescales as f32 - 1.0);
     for row in 0..rows {
         let position = (start + row) as f32;
-        for index in 0..dim {
-            values[row * dim + index] *= embedding_scale;
-        }
-        for index in 0..timescales {
-            let angle = position * (-(index as f32) * log_increment).exp();
-            values[row * dim + index] += angle.sin();
-            values[row * dim + timescales + index] += angle.cos();
-        }
+        add_position(
+            values,
+            row * dim,
+            position,
+            dim,
+            timescales,
+            embedding_scale,
+            log_increment,
+        );
     }
 }
 
@@ -27,14 +47,15 @@ pub(super) fn add_same(values: &mut [f32], rows: usize, position: usize, dim: us
     let timescales = dim / 2;
     let log_increment = 10_000.0f32.ln() / (timescales as f32 - 1.0);
     for row in 0..rows {
-        for index in 0..dim {
-            values[row * dim + index] *= embedding_scale;
-        }
-        for index in 0..timescales {
-            let angle = position as f32 * (-(index as f32) * log_increment).exp();
-            values[row * dim + index] += angle.sin();
-            values[row * dim + timescales + index] += angle.cos();
-        }
+        add_position(
+            values,
+            row * dim,
+            position as f32,
+            dim,
+            timescales,
+            embedding_scale,
+            log_increment,
+        );
     }
 }
 

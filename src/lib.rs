@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 //! Pure Rust inference for Bergamot-compatible Marian translation models.

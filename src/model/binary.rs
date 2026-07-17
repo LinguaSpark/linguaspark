@@ -69,10 +69,6 @@ struct Header {
 
 impl ModelArchive {
     /// Parse a Marian v1 binary archive.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if binary parsing or basic configuration validation fails.
     pub(crate) fn load(bytes: Vec<u8>) -> Result<Self, LoadError> {
         let mut reader = Cursor::new(bytes);
 

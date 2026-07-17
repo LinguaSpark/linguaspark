@@ -4,32 +4,32 @@ use crate::error::LoadError;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub struct ModelConfig {
+pub(crate) struct ModelConfig {
     #[serde(rename = "type")]
-    pub model_type: String,
-    pub dim_emb: usize,
-    pub dim_vocabs: Vec<usize>,
-    pub enc_depth: usize,
-    pub dec_depth: usize,
-    pub transformer_heads: usize,
-    pub transformer_dim_ffn: usize,
-    pub transformer_ffn_depth: usize,
-    pub transformer_ffn_activation: String,
-    pub transformer_decoder_autoreg: String,
-    pub dec_cell: String,
+    pub(crate) model_type: String,
+    pub(crate) dim_emb: usize,
+    pub(crate) dim_vocabs: Vec<usize>,
+    pub(crate) enc_depth: usize,
+    pub(crate) dec_depth: usize,
+    pub(crate) transformer_heads: usize,
+    pub(crate) transformer_dim_ffn: usize,
+    pub(crate) transformer_ffn_depth: usize,
+    pub(crate) transformer_ffn_activation: String,
+    pub(crate) transformer_decoder_autoreg: String,
+    pub(crate) dec_cell: String,
     #[serde(default)]
-    pub tied_embeddings: bool,
+    pub(crate) tied_embeddings: bool,
     #[serde(default)]
-    pub tied_embeddings_all: bool,
+    pub(crate) tied_embeddings_all: bool,
     #[serde(default)]
-    pub layer_normalization: bool,
+    pub(crate) layer_normalization: bool,
     #[serde(default)]
-    pub transformer_postprocess: String,
+    pub(crate) transformer_postprocess: String,
     #[serde(default)]
-    pub transformer_preprocess: String,
+    pub(crate) transformer_preprocess: String,
     #[serde(default)]
-    pub transformer_postprocess_top: String,
-    pub version: String,
+    pub(crate) transformer_postprocess_top: String,
+    pub(crate) version: String,
 }
 
 impl ModelConfig {

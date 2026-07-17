@@ -53,11 +53,12 @@ impl Embedding {
     }
 
     pub(super) fn lookup(&self, ids: &[TokenId]) -> Result<Vec<f32>, TranslateError> {
+        let inverse_multiplier = 1.0 / self.multiplier;
         let mut output = Vec::with_capacity(ids.len() * self.cols);
         for &id in ids {
             let id = id as usize;
             if id >= self.rows {
-                return Err(TranslateError::Inference(format!(
+                return Err(TranslateError::Runtime(format!(
                     "embedding ID {id} is outside vocabulary {}",
                     self.rows
                 )));
@@ -66,7 +67,7 @@ impl Embedding {
             output.extend(
                 self.values[start..start + self.cols]
                     .iter()
-                    .map(|&value| f32::from(value) / self.multiplier),
+                    .map(|&value| f32::from(value) * inverse_multiplier),
             );
         }
         Ok(output)
@@ -76,12 +77,13 @@ impl Embedding {
         &self,
         ids: &[Option<TokenId>],
     ) -> Result<Vec<f32>, TranslateError> {
+        let inverse_multiplier = 1.0 / self.multiplier;
         let mut output = vec![0.0; ids.len() * self.cols];
         for (row, id) in ids.iter().copied().enumerate() {
             let Some(id) = id else { continue };
             let id = id as usize;
             if id >= self.rows {
-                return Err(TranslateError::Inference(format!(
+                return Err(TranslateError::Runtime(format!(
                     "embedding ID {id} is outside vocabulary {}",
                     self.rows
                 )));
@@ -89,7 +91,7 @@ impl Embedding {
             let source = &self.values[id * self.cols..(id + 1) * self.cols];
             let target = &mut output[row * self.cols..(row + 1) * self.cols];
             for (target, &source) in target.iter_mut().zip(source) {
-                *target = f32::from(source) / self.multiplier;
+                *target = f32::from(source) * inverse_multiplier;
             }
         }
         Ok(output)
@@ -125,7 +127,7 @@ impl OutputProjection {
         for &token in shortlist {
             let token = token as usize;
             if token >= self.rows {
-                return Err(TranslateError::Inference(format!(
+                return Err(TranslateError::Runtime(format!(
                     "target ID {token} exceeds output vocabulary {}",
                     self.rows
                 )));
@@ -142,7 +144,7 @@ impl OutputProjection {
             self.activation_multiplier,
             Some(bias),
         )
-        .map_err(|err| TranslateError::Inference(err.to_string()))?;
+        .map_err(|err| TranslateError::Runtime(err.to_string()))?;
         Ok(PreparedOutput { linear })
     }
 }

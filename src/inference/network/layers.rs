@@ -50,7 +50,7 @@ impl Ssru {
         let candidate = self.candidate.apply(input)?;
         let forget = self.forget.apply(input)?;
         if cell.len() != input.len() || !input.len().is_multiple_of(self.dim) {
-            return Err(TranslateError::Inference(
+            return Err(TranslateError::Runtime(
                 "SSRU cell has an invalid dimension".into(),
             ));
         }
@@ -71,7 +71,7 @@ impl LayerNorm {
         residual: &[f32],
     ) -> Result<Vec<f32>, TranslateError> {
         if output.len() != residual.len() || !output.len().is_multiple_of(self.dim) {
-            return Err(TranslateError::Inference(
+            return Err(TranslateError::Runtime(
                 "invalid layer norm input shape".into(),
             ));
         }
@@ -80,8 +80,9 @@ impl LayerNorm {
             .zip(residual)
             .map(|(&a, &b)| a + b)
             .collect::<Vec<_>>();
+        let inverse_dim = 1.0 / self.dim as f32;
         for row in result.chunks_exact_mut(self.dim) {
-            let mean = row.iter().sum::<f32>() / self.dim as f32;
+            let mean = row.iter().sum::<f32>() * inverse_dim;
             let variance = row
                 .iter()
                 .map(|value| {
@@ -89,7 +90,7 @@ impl LayerNorm {
                     centered * centered
                 })
                 .sum::<f32>()
-                / self.dim as f32;
+                * inverse_dim;
             let inverse_std = 1.0 / (variance + LAYER_NORM_EPSILON).sqrt();
             for (index, value) in row.iter_mut().enumerate() {
                 *value = (*value - mean) * inverse_std * self.scale[index] + self.bias[index];

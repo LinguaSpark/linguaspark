@@ -8,16 +8,16 @@ pub(crate) struct EncodedBatch {
     pub(super) batch_size: usize,
     pub(super) width: usize,
     pub(super) mask: Vec<bool>,
+    pub(super) all_keys_valid: bool,
     pub(super) cross: Vec<CrossCache>,
 }
 
 pub(crate) struct DecodeStepRequest<'a> {
-    pub source: &'a EncodedBatch,
-    pub source_indices: &'a [usize],
-    pub beam_size: usize,
-    pub previous: &'a [Option<TokenId>],
-    pub position: usize,
-    pub output: &'a PreparedOutput,
+    pub(crate) source: &'a EncodedBatch,
+    pub(crate) source_indices: &'a [usize],
+    pub(crate) previous: &'a [Option<TokenId>],
+    pub(crate) position: usize,
+    pub(crate) output: &'a PreparedOutput,
 }
 
 #[derive(Clone)]
@@ -32,10 +32,16 @@ impl DecoderState {
         }
     }
 
-    pub(super) fn select(&self, rows: &[usize], dim: usize) -> Self {
+    pub(super) fn select(self, rows: &[usize], dim: usize) -> Self {
+        let selected_len = rows.len() * dim;
+        if rows.iter().copied().eq(0..rows.len())
+            && self.cells.iter().all(|layer| layer.len() == selected_len)
+        {
+            return self;
+        }
         let cells = self
             .cells
-            .iter()
+            .into_iter()
             .map(|layer| {
                 let mut selected = Vec::with_capacity(rows.len() * dim);
                 for &row in rows {

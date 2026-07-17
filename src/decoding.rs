@@ -32,21 +32,21 @@ impl Default for DecodeOptions {
 
 #[derive(Clone, Copy)]
 pub(crate) struct DecodeBatchRequest<'a> {
-    pub network: &'a Network,
-    pub encoded: &'a EncodedBatch,
-    pub output: &'a PreparedOutput,
-    pub shortlist: &'a [TokenId],
-    pub forbidden: Option<TokenId>,
-    pub eos: TokenId,
-    pub empty_inputs: &'a [bool],
-    pub max_len: usize,
-    pub options: &'a DecodeOptions,
+    pub(crate) network: &'a Network,
+    pub(crate) encoded: &'a EncodedBatch,
+    pub(crate) output: &'a PreparedOutput,
+    pub(crate) shortlist: &'a [TokenId],
+    pub(crate) forbidden: Option<TokenId>,
+    pub(crate) eos: TokenId,
+    pub(crate) empty_inputs: &'a [bool],
+    pub(crate) max_len: usize,
+    pub(crate) options: &'a DecodeOptions,
 }
 
 pub(crate) struct DecodedHypothesis {
-    pub tokens: Vec<TokenId>,
-    pub score: f32,
-    pub finished: bool,
+    pub(crate) tokens: Vec<TokenId>,
+    pub(crate) score: f32,
+    pub(crate) finished: bool,
 }
 
 pub(crate) fn decode_batch(
@@ -74,7 +74,6 @@ pub(crate) fn decode_batch(
         if active.is_empty() {
             break;
         }
-        let active_batch = active.len();
         let beam_width = active
             .iter()
             .map(|&original| beams[original].len())
@@ -83,33 +82,37 @@ pub(crate) fn decode_batch(
         if beam_width == 0 {
             break;
         }
-        let mut previous = Vec::with_capacity(beam_width * active_batch);
-        for beam_index in 0..beam_width {
-            for &original in &active {
-                previous.push(
-                    beams[original]
-                        .get(beam_index)
-                        .and_then(|hypothesis| hypothesis.previous)
-                        .or_else(|| (position != 0).then_some(request.eos)),
-                );
-            }
-        }
+        let decode_rows = compact_decode_rows(&beams, &active, beam_width);
+        debug_assert_eq!(decode_rows.previous.len(), decode_rows.source_indices.len());
+        debug_assert_eq!(
+            decode_rows.previous.len(),
+            decode_rows.beam_rows.iter().map(Vec::len).sum::<usize>()
+        );
+        debug_assert!(
+            decode_rows
+                .source_indices
+                .iter()
+                .all(|&source| source < batch_size)
+        );
         let mut next_state = state;
         let mut logits = request.network.decode_step_batch(
             &mut next_state,
             DecodeStepRequest {
                 source: request.encoded,
-                source_indices: &active,
-                beam_size: beam_width,
-                previous: &previous,
+                source_indices: &decode_rows.source_indices,
+                previous: &decode_rows.previous,
                 position,
                 output: request.output,
             },
         )?;
         let vocab = request.shortlist.len();
+        debug_assert_eq!(
+            Some(logits.len()),
+            decode_rows.previous.len().checked_mul(vocab)
+        );
         let mut next_beams = (0..batch_size).map(|_| Vec::new()).collect::<Vec<_>>();
 
-        for (current_batch, &original) in active.iter().enumerate() {
+        for &original in &active {
             if position == 0 && request.empty_inputs[original] {
                 completed[original].push(Hypothesis {
                     history: None,
@@ -117,7 +120,7 @@ pub(crate) fn decode_batch(
                     score: 0.0,
                     length: 1,
                     finished: true,
-                    state_parent: current_batch,
+                    state_parent: decode_rows.beam_rows[original][0],
                 });
                 continue;
             }
@@ -125,7 +128,7 @@ pub(crate) fn decode_batch(
             let beam = &beams[original];
             let mut expansions = Vec::with_capacity(beam.len() * vocab);
             for (parent, hypothesis) in beam.iter().enumerate() {
-                let row_index = parent * active_batch + current_batch;
+                let row_index = decode_rows.beam_rows[original][parent];
                 let row = &mut logits[row_index * vocab..(row_index + 1) * vocab];
                 log_softmax_in_place(row);
                 for (&log_prob, &token) in row.iter().zip(request.shortlist) {
@@ -179,7 +182,7 @@ pub(crate) fn decode_batch(
             break;
         }
         let parents = parent_state_rows(&beams, &next_active);
-        state = request.network.select_decoder_state(&next_state, &parents);
+        state = request.network.select_decoder_state(next_state, &parents);
         active = next_active;
     }
 
@@ -192,7 +195,7 @@ pub(crate) fn decode_batch(
                 normalized_score(a, request.options)
                     .total_cmp(&normalized_score(b, request.options))
             })
-            .ok_or_else(|| TranslateError::Inference("beam search returned no result".into()))?;
+            .ok_or_else(|| TranslateError::Runtime("beam search returned no result".into()))?;
         results.push(DecodedHypothesis {
             tokens: materialize_history(&history, best.history),
             score: normalized_score(best, request.options),
@@ -218,6 +221,37 @@ fn active_sentences(active: &[usize], beams: &[Vec<Hypothesis>]) -> Vec<usize> {
         .collect()
 }
 
+struct DecodeRows {
+    previous: Vec<Option<TokenId>>,
+    source_indices: Vec<usize>,
+    beam_rows: Vec<Vec<usize>>,
+}
+
+fn compact_decode_rows(
+    beams: &[Vec<Hypothesis>],
+    active: &[usize],
+    beam_width: usize,
+) -> DecodeRows {
+    let row_count = active.iter().map(|&original| beams[original].len()).sum();
+    let mut previous = Vec::with_capacity(row_count);
+    let mut source_indices = Vec::with_capacity(row_count);
+    let mut beam_rows = (0..beams.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+    for beam_index in 0..beam_width {
+        for &original in active {
+            if let Some(hypothesis) = beams[original].get(beam_index) {
+                beam_rows[original].push(previous.len());
+                previous.push(hypothesis.previous);
+                source_indices.push(original);
+            }
+        }
+    }
+    DecodeRows {
+        previous,
+        source_indices,
+        beam_rows,
+    }
+}
+
 fn parent_state_rows(beams: &[Vec<Hypothesis>], active: &[usize]) -> Vec<usize> {
     let beam_width = active
         .iter()
@@ -227,11 +261,9 @@ fn parent_state_rows(beams: &[Vec<Hypothesis>], active: &[usize]) -> Vec<usize> 
     let mut parents = Vec::with_capacity(beam_width * active.len());
     for beam_index in 0..beam_width {
         for &original in active {
-            parents.push(
-                beams[original]
-                    .get(beam_index)
-                    .map_or(0, |hypothesis| hypothesis.state_parent),
-            );
+            if let Some(hypothesis) = beams[original].get(beam_index) {
+                parents.push(hypothesis.state_parent);
+            }
         }
     }
     parents
@@ -297,8 +329,9 @@ fn retain_top_k(expansions: &mut Vec<Expansion>, count: usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodeOptions, Expansion, HistoryNode, Hypothesis, active_sentences, log_softmax_in_place,
-        materialize_history, next_beam_limit, normalized_score, parent_state_rows, retain_top_k,
+        DecodeOptions, Expansion, HistoryNode, Hypothesis, active_sentences, compact_decode_rows,
+        log_softmax_in_place, materialize_history, next_beam_limit, normalized_score,
+        parent_state_rows, retain_top_k,
     };
 
     fn hypothesis(score: f32, length: usize) -> Hypothesis {
@@ -414,12 +447,33 @@ mod tests {
         ];
         let active = active_sentences(&[0, 1, 2, 3], &beams);
         assert_eq!(active, [0, 2, 3]);
-        // Beam-major, then active batch. Missing beam slots use Marian's
-        // dummy state row zero.
+        // Beam-major, skipping missing beam slots.
+        assert_eq!(parent_state_rows(&beams, &active), [10, 12, 13, 20, 23, 33]);
+    }
+
+    #[test]
+    fn packs_only_live_beams_and_tracks_their_rows() {
+        let make = |token| Hypothesis {
+            history: None,
+            previous: Some(token),
+            score: 0.0,
+            length: 1,
+            finished: false,
+            state_parent: 0,
+        };
+        let beams = vec![
+            vec![make(10), make(20)],
+            Vec::new(),
+            vec![make(12)],
+            vec![make(13), make(23), make(33)],
+        ];
+        let rows = compact_decode_rows(&beams, &[0, 2, 3], 3);
         assert_eq!(
-            parent_state_rows(&beams, &active),
-            [10, 12, 13, 20, 0, 23, 0, 0, 33]
+            rows.previous,
+            [Some(10), Some(12), Some(13), Some(20), Some(23), Some(33)]
         );
+        assert_eq!(rows.source_indices, [0, 2, 3, 0, 3, 3]);
+        assert_eq!(rows.beam_rows, [vec![0, 3], vec![], vec![1], vec![2, 4, 5]]);
     }
 
     #[test]

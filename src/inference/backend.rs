@@ -9,20 +9,20 @@ use rten_vecmath::Quantize;
 use crate::error::{LoadError, TranslateError};
 use crate::model::{Tensor, TensorData};
 
-pub(crate) struct MatrixView<'a> {
-    pub data: &'a [f32],
-    pub rows: usize,
-    pub cols: usize,
-    pub row_stride: usize,
-    pub col_stride: usize,
+pub(super) struct MatrixView<'a> {
+    pub(super) data: &'a [f32],
+    pub(super) rows: usize,
+    pub(super) cols: usize,
+    pub(super) row_stride: usize,
+    pub(super) col_stride: usize,
 }
 
-pub(crate) fn batched_matmul_f32(
+pub(super) fn batched_matmul_f32(
     lhs: &[MatrixView<'_>],
     rhs: &[MatrixView<'_>],
 ) -> Result<Vec<f32>, TranslateError> {
     if lhs.len() != rhs.len() {
-        return Err(TranslateError::Inference(
+        return Err(TranslateError::Runtime(
             "batched matrix inputs have different lengths".into(),
         ));
     }
@@ -32,7 +32,7 @@ pub(crate) fn batched_matmul_f32(
     let output_stride = lhs[0]
         .rows
         .checked_mul(rhs[0].cols)
-        .ok_or_else(|| TranslateError::Inference("matrix output size overflow".into()))?;
+        .ok_or_else(|| TranslateError::Runtime("matrix output size overflow".into()))?;
     let expected_lhs_rows = lhs[0].rows;
     let expected_inner = lhs[0].cols;
     let expected_rhs_cols = rhs[0].cols;
@@ -44,7 +44,7 @@ pub(crate) fn batched_matmul_f32(
             || lhs.cols != expected_inner
             || rhs.cols != expected_rhs_cols
         {
-            return Err(TranslateError::Inference(
+            return Err(TranslateError::Runtime(
                 "batched matrix dimensions do not match".into(),
             ));
         }
@@ -54,7 +54,7 @@ pub(crate) fn batched_matmul_f32(
                 lhs.data,
                 [lhs.row_stride, lhs.col_stride],
             )
-            .map_err(|err| TranslateError::Inference(format!("invalid lhs matrix view: {err}")))?,
+            .map_err(|err| TranslateError::Runtime(format!("invalid lhs matrix view: {err}")))?,
         );
         rhs_matrices.push(
             NdTensorView::from_slice_with_strides(
@@ -62,7 +62,7 @@ pub(crate) fn batched_matmul_f32(
                 rhs.data,
                 [rhs.row_stride, rhs.col_stride],
             )
-            .map_err(|err| TranslateError::Inference(format!("invalid rhs matrix view: {err}")))?,
+            .map_err(|err| TranslateError::Runtime(format!("invalid rhs matrix view: {err}")))?,
         );
     }
     let lhs_inputs = lhs_matrices
@@ -78,7 +78,7 @@ pub(crate) fn batched_matmul_f32(
     let output_len = lhs
         .len()
         .checked_mul(output_stride)
-        .ok_or_else(|| TranslateError::Inference("batched matrix output size overflow".into()))?;
+        .ok_or_else(|| TranslateError::Runtime("batched matrix output size overflow".into()))?;
     let mut output = vec![0.0; output_len];
     let executor = GemmExecutor::<f32, f32, f32>::default();
     // RTen's batched API parallelizes across heads with Rayon, which regresses
@@ -93,13 +93,13 @@ pub(crate) fn batched_matmul_f32(
         // beta=0 means RTen does not read the initialized zeroes.
         executor
             .gemm(output, *lhs, *rhs, GemmOptions::default())
-            .map_err(|err| TranslateError::Inference(format!("RTen f32 GEMM failed: {err}")))?;
+            .map_err(|err| TranslateError::Runtime(format!("RTen f32 GEMM failed: {err}")))?;
     }
     Ok(output)
 }
 
 /// A compiled affine transform backed exclusively by `RTen`'s int8 GEMM.
-pub(crate) struct Linear {
+pub(super) struct Linear {
     input_dim: usize,
     output_dim: usize,
     weight: PackedBMatrix<i8>,
@@ -109,11 +109,11 @@ pub(crate) struct Linear {
 }
 
 impl Linear {
-    pub(crate) fn shape(&self) -> (usize, usize) {
+    pub(super) fn shape(&self) -> (usize, usize) {
         (self.input_dim, self.output_dim)
     }
 
-    pub(crate) fn compile(
+    pub(super) fn compile(
         tensor: Tensor,
         bias: Option<Vec<f32>>,
         activation_multiplier: f32,
@@ -149,7 +149,7 @@ impl Linear {
         )
     }
 
-    pub(crate) fn from_quantized(
+    pub(super) fn from_quantized(
         name: &str,
         input_dim: usize,
         output_dim: usize,
@@ -201,9 +201,9 @@ impl Linear {
         })
     }
 
-    pub(crate) fn apply(&self, input: &[f32]) -> Result<Vec<f32>, TranslateError> {
+    pub(super) fn apply(&self, input: &[f32]) -> Result<Vec<f32>, TranslateError> {
         if !input.len().is_multiple_of(self.input_dim) {
-            return Err(TranslateError::Inference(format!(
+            return Err(TranslateError::Runtime(format!(
                 "linear input length {} is not divisible by {}",
                 input.len(),
                 self.input_dim
@@ -254,7 +254,7 @@ impl Linear {
                     ..Default::default()
                 },
             )
-            .map_err(|err| TranslateError::Inference(format!("RTen int8 GEMM failed: {err}")))?;
+            .map_err(|err| TranslateError::Runtime(format!("RTen int8 GEMM failed: {err}")))?;
         let scale = 1.0 / (activation_multiplier * weight_multiplier);
         Ok(output.iter().map(|&value| value as f32 * scale).collect())
     }

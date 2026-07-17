@@ -16,33 +16,25 @@ pub enum LoadError {
     #[error("invalid lexical shortlist: {0}")]
     InvalidShortlist(String),
 
-    /// A SentencePiece vocabulary is malformed or incompatible.
-    #[error("invalid SentencePiece model: {0}")]
-    InvalidSentencePiece(String),
+    /// A vocabulary is malformed or incompatible.
+    #[error("invalid vocabulary: {0}")]
+    InvalidVocabulary(String),
 }
 
 #[derive(Debug, Error)]
-#[non_exhaustive]
 /// An error encountered while creating an inference executor.
-pub enum ExecutorError {
-    /// The single-threaded Rayon execution context could not be created.
-    #[error("failed to create inference executor: {0}")]
-    ThreadPool(String),
-}
+#[error("failed to create inference executor: {0}")]
+pub struct ExecutorError(#[source] pub(crate) rayon::ThreadPoolBuildError);
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
 /// An error encountered while translating text.
 pub enum TranslateError {
-    /// The input or decode options are invalid.
-    #[error("invalid translation input: {0}")]
-    InvalidInput(String),
+    /// The decode options are invalid.
+    #[error("invalid translation options: {0}")]
+    InvalidOptions(String),
 
-    /// Source encoding or target decoding failed.
-    #[error("tokenization failed: {0}")]
-    Tokenization(String),
-
-    /// Model inference failed.
-    #[error("inference failed: {0}")]
-    Inference(String),
+    /// Translation failed while processing the model or text.
+    #[error("translation failed: {0}")]
+    Runtime(String),
 }

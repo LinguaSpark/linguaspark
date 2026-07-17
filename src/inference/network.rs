@@ -50,11 +50,7 @@ impl Network {
         DecoderState::new(self.spec.decoder_layers, rows, self.spec.dim)
     }
 
-    pub(crate) fn select_decoder_state(
-        &self,
-        state: &DecoderState,
-        rows: &[usize],
-    ) -> DecoderState {
+    pub(crate) fn select_decoder_state(&self, state: DecoderState, rows: &[usize]) -> DecoderState {
         state.select(rows, self.spec.dim)
     }
 
@@ -73,7 +69,7 @@ impl Network {
         width: usize,
     ) -> Result<EncodedBatch, TranslateError> {
         if source.len() != batch_size * width || mask.len() != source.len() {
-            return Err(TranslateError::Inference(
+            return Err(TranslateError::Runtime(
                 "invalid source batch dimensions".into(),
             ));
         }
@@ -81,20 +77,27 @@ impl Network {
         // Marian stores input IDs time-major. Attention is simpler with each
         // sentence contiguous, so transpose to [batch, time] after lookup.
         let time_major = self.source_embedding.lookup(source)?;
-        let mut hidden = vec![0.0; time_major.len()];
-        for time in 0..width {
-            for batch in 0..batch_size {
-                let source_row = time * batch_size + batch;
-                let target_row = batch * width + time;
-                hidden[target_row * self.spec.dim..(target_row + 1) * self.spec.dim]
-                    .copy_from_slice(
-                        &time_major[source_row * self.spec.dim..(source_row + 1) * self.spec.dim],
-                    );
+        let mut hidden = if batch_size == 1 {
+            time_major
+        } else {
+            let mut hidden = vec![0.0; time_major.len()];
+            for time in 0..width {
+                for batch in 0..batch_size {
+                    let source_row = time * batch_size + batch;
+                    let target_row = batch * width + time;
+                    hidden[target_row * self.spec.dim..(target_row + 1) * self.spec.dim]
+                        .copy_from_slice(
+                            &time_major
+                                [source_row * self.spec.dim..(source_row + 1) * self.spec.dim],
+                        );
+                }
             }
-        }
+            hidden
+        };
+        let all_keys_valid = mask.iter().all(|&valid| valid);
         position::add_batch(&mut hidden, batch_size, width, self.spec.dim);
         for layer in &self.encoder {
-            hidden = layer.apply_batch(&hidden, batch_size, width, mask)?;
+            hidden = layer.apply_batch(&hidden, batch_size, width, mask, all_keys_valid)?;
         }
 
         let mut cross = Vec::with_capacity(self.decoder.len());
@@ -108,6 +111,7 @@ impl Network {
             batch_size,
             width,
             mask: mask.to_vec(),
+            all_keys_valid,
             cross,
         })
     }
@@ -117,10 +121,9 @@ impl Network {
         state: &mut DecoderState,
         request: DecodeStepRequest<'_>,
     ) -> Result<Vec<f32>, TranslateError> {
-        let active_batch = request.source_indices.len();
-        let rows = request.beam_size * active_batch;
-        if request.previous.len() != rows {
-            return Err(TranslateError::Inference(
+        let rows = request.previous.len();
+        if request.source_indices.len() != rows {
+            return Err(TranslateError::Runtime(
                 "invalid decoder batch dimensions".into(),
             ));
         }
@@ -134,7 +137,6 @@ impl Network {
                 request.source,
                 &request.source.cross[index],
                 request.source_indices,
-                request.beam_size,
             )?;
             hidden = layer.ffn.apply(&hidden)?;
         }
@@ -150,10 +152,15 @@ impl EncoderLayer {
         batch_size: usize,
         width: usize,
         time_major_mask: &[bool],
+        all_keys_valid: bool,
     ) -> Result<Vec<f32>, TranslateError> {
-        let attended =
-            self.attention
-                .apply_self_batch(input, batch_size, width, time_major_mask)?;
+        let attended = self.attention.apply_self_batch(
+            input,
+            batch_size,
+            width,
+            time_major_mask,
+            all_keys_valid,
+        )?;
         self.ffn.apply(&attended)
     }
 }
