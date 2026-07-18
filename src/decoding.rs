@@ -126,6 +126,32 @@ pub(crate) fn decode_batch(
             }
 
             let beam = &beams[original];
+            if request.options.beam_size == 1 {
+                debug_assert_eq!(beam.len(), 1);
+                let parent = &beam[0];
+                let row_index = decode_rows.beam_rows[original][0];
+                let row = &mut logits[row_index * vocab..(row_index + 1) * vocab];
+                log_softmax_in_place(row);
+                if let Some((token, score)) =
+                    select_greedy(row, request.shortlist, request.forbidden, parent.score)
+                {
+                    push_expansion(
+                        Expansion {
+                            parent: 0,
+                            parent_row: row_index,
+                            token,
+                            score,
+                        },
+                        beam,
+                        request.eos,
+                        &mut history,
+                        &mut completed[original],
+                        &mut next_beams[original],
+                    );
+                }
+                continue;
+            }
+
             let mut expansions = Vec::with_capacity(beam.len() * vocab);
             for (parent, hypothesis) in beam.iter().enumerate() {
                 let row_index = decode_rows.beam_rows[original][parent];
@@ -146,30 +172,14 @@ pub(crate) fn decode_batch(
             retain_top_k(&mut expansions, next_beam_size);
 
             for expansion in expansions {
-                let parent = &beam[expansion.parent];
-                let finished = expansion.token == request.eos;
-                let history_index = if finished {
-                    parent.history
-                } else {
-                    history.push(HistoryNode {
-                        parent: parent.history,
-                        token: expansion.token,
-                    });
-                    Some(history.len() - 1)
-                };
-                let hypothesis = Hypothesis {
-                    history: history_index,
-                    previous: (!finished).then_some(expansion.token),
-                    score: expansion.score,
-                    length: parent.length + 1,
-                    finished,
-                    state_parent: expansion.parent_row,
-                };
-                if finished {
-                    completed[original].push(hypothesis);
-                } else {
-                    next_beams[original].push(hypothesis);
-                }
+                push_expansion(
+                    expansion,
+                    beam,
+                    request.eos,
+                    &mut history,
+                    &mut completed[original],
+                    &mut next_beams[original],
+                );
             }
         }
 
@@ -291,6 +301,59 @@ struct Expansion {
     score: f32,
 }
 
+fn select_greedy(
+    log_probs: &[f32],
+    shortlist: &[TokenId],
+    forbidden: Option<TokenId>,
+    parent_score: f32,
+) -> Option<(TokenId, f32)> {
+    log_probs
+        .iter()
+        .copied()
+        .zip(shortlist.iter().copied())
+        .filter(|&(_, token)| Some(token) != forbidden)
+        .map(|(log_prob, token)| (token, parent_score + log_prob))
+        .fold(None, |best, candidate| match best {
+            Some((_, best_score)) if candidate.1 > best_score => Some(candidate),
+            Some(_) => best,
+            None => Some(candidate),
+        })
+}
+
+fn push_expansion(
+    expansion: Expansion,
+    beam: &[Hypothesis],
+    eos: TokenId,
+    history: &mut Vec<HistoryNode>,
+    completed: &mut Vec<Hypothesis>,
+    next_beam: &mut Vec<Hypothesis>,
+) {
+    let parent = &beam[expansion.parent];
+    let finished = expansion.token == eos;
+    let history_index = if finished {
+        parent.history
+    } else {
+        history.push(HistoryNode {
+            parent: parent.history,
+            token: expansion.token,
+        });
+        Some(history.len() - 1)
+    };
+    let hypothesis = Hypothesis {
+        history: history_index,
+        previous: (!finished).then_some(expansion.token),
+        score: expansion.score,
+        length: parent.length + 1,
+        finished,
+        state_parent: expansion.parent_row,
+    };
+    if finished {
+        completed.push(hypothesis);
+    } else {
+        next_beam.push(hypothesis);
+    }
+}
+
 fn materialize_history(history: &[HistoryNode], mut index: Option<usize>) -> Vec<TokenId> {
     let mut tokens = Vec::new();
     while let Some(current) = index {
@@ -331,7 +394,7 @@ mod tests {
     use super::{
         DecodeOptions, Expansion, HistoryNode, Hypothesis, active_sentences, compact_decode_rows,
         log_softmax_in_place, materialize_history, next_beam_limit, normalized_score,
-        parent_state_rows, retain_top_k,
+        parent_state_rows, retain_top_k, select_greedy,
     };
 
     fn hypothesis(score: f32, length: usize) -> Hypothesis {
@@ -391,6 +454,27 @@ mod tests {
         let probability_sum = values.iter().map(|value| value.exp()).sum::<f32>();
         assert!((probability_sum - 1.0).abs() < 1e-6);
         assert!(values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn greedy_selects_the_best_allowed_cumulative_score() {
+        assert_eq!(
+            select_greedy(&[-3.0, -1.0, -2.0], &[10, 20, 30], Some(20), -4.0),
+            Some((30, -6.0))
+        );
+    }
+
+    #[test]
+    fn greedy_keeps_the_first_candidate_when_cumulative_scores_tie() {
+        assert_eq!(
+            select_greedy(&[-2.0, -1.0], &[10, 20], None, -33_554_432.0),
+            Some((10, -33_554_432.0))
+        );
+    }
+
+    #[test]
+    fn greedy_returns_none_without_an_allowed_candidate() {
+        assert_eq!(select_greedy(&[-1.0], &[10], Some(10), 0.0), None);
     }
 
     #[test]
